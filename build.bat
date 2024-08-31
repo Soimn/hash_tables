@@ -19,7 +19,7 @@ if "%1"=="debug" (
   set "compile_options=%common_compile_options% /Od /Zo /Z7 /RTC1 /MTd"
   set "link_options=%common_link_options% /DEBUG:FULL"
 ) else if "%1"=="release" (
-  set "compile_options=%common_compile_options% /O2"
+  set "compile_options=%common_compile_options% /O2 /Zo /Z7"
   set "link_options=%common_link_options%"
 ) else (
   goto invalid_arguments

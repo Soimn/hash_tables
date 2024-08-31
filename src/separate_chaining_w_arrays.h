@@ -2,7 +2,7 @@ typedef struct SCWA_Table_Entry
 {
   u64 hash;
   String key;
-  void* data;
+  u64 data;
 } SCWA_Table_Entry;
 
 typedef struct SCWA_Bucket
@@ -69,7 +69,7 @@ SCWA_Table__FindEntry(SCWA_Table* table, u64 hash, u64 bucket_idx, String key)
 }
 
 static bool
-SCWA_Table_Put(SCWA_Table* table, String key, void* data)
+SCWA_Table_Put(SCWA_Table* table, String key, u64 data)
 {
   u64 hash = table->hash_func(key);
   u64 bucket_idx = hash % table->bucket_count;
@@ -108,7 +108,7 @@ SCWA_Table_Put(SCWA_Table* table, String key, void* data)
 }
 
 static bool
-SCWA_Table_Get(SCWA_Table* table, String key, void** data)
+SCWA_Table_Get(SCWA_Table* table, String key, u64* data)
 {
   u64 hash = table->hash_func(key);
   u64 bucket_idx = hash % table->bucket_count;
@@ -120,23 +120,5 @@ SCWA_Table_Get(SCWA_Table* table, String key, void** data)
   {
     *data = table->buckets[bucket_idx]->entries[idx].data;
     return true;
-  }
-}
-
-static bool
-SCWA_Table_Remove(SCWA_Table* table, String key)
-{
-  u64 hash = table->hash_func(key);
-  u64 bucket_idx = hash % table->bucket_count;
-
-  s64 idx = SCWA_Table__FindEntry(table, hash, bucket_idx, key);
-
-  if (idx == -1) return false;
-  else
-  {
-    SCWA_Bucket* bucket = table->buckets[bucket_idx];
-    
-    bucket->entries[idx] = bucket->entries[bucket->size-1];
-    bucket->size -= 1;
   }
 }

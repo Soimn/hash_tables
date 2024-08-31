@@ -2,7 +2,7 @@ typedef struct SCOA_Table_Entry
 {
   u64 hash;
   String key;
-  void* data;
+  u64 data;
 } SCOA_Table_Entry;
 
 typedef struct SCOA_Table
@@ -66,7 +66,7 @@ SCOA_Table__FindEntry(SCOA_Table* table, u64 hash, String key)
 }
 
 static bool
-SCOA_Table_Put(SCOA_Table* table, String key, void* data)
+SCOA_Table_Put(SCOA_Table* table, String key, u64 data)
 {
   u64 hash = SCOA_Table__HashKey(table, key);
   s64 idx = SCOA_Table__FindEntry(table, hash, key);
@@ -88,7 +88,7 @@ SCOA_Table_Put(SCOA_Table* table, String key, void* data)
 }
 
 static bool
-SCOA_Table_Get(SCOA_Table* table, String key, void** data)
+SCOA_Table_Get(SCOA_Table* table, String key, u64* data)
 {
   u64 hash = SCOA_Table__HashKey(table, key);
   s64 idx = SCOA_Table__FindEntry(table, hash, key);
@@ -97,36 +97,6 @@ SCOA_Table_Get(SCOA_Table* table, String key, void** data)
   else
   {
     *data = table->buckets[idx].data;
-
-    return true;
-  }
-}
-
-static bool
-SCOA_Table_Remove(SCOA_Table* table, String key)
-{
-  u64 hash = SCOA_Table__HashKey(table, key);
-  u64 bucket_idx = hash % table->bucket_count;
-
-  SCOA_Table_Entry* bucket = &table->buckets[bucket_idx * table->bucket_size];
-
-  u64 idx = 0;
-  for (; idx < table->bucket_size; ++idx)
-  {
-    if (bucket[idx].hash == 0 || bucket[idx].hash == hash && String_Match(bucket[idx].key, key))
-    {
-      break;
-    }
-  }
-
-  if (idx >= table->bucket_size || bucket[idx].hash == 0) return false;
-  else
-  {
-    u64 last_idx = idx;
-    while (last_idx < table->bucket_size-1 && bucket[last_idx].hash != 0) ++last_idx;
-
-    bucket[idx] = bucket[last_idx];
-    if (last_idx != idx) bucket[last_idx].hash = 0;
 
     return true;
   }

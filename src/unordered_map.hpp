@@ -26,6 +26,12 @@ struct String
     for (char* scan = cstring; *scan != 0; ++scan) ++this->len;
   }
 
+  String(char* data, u64 len)
+  {
+    this->data = data;
+    this->len  = len;
+  }
+
   bool operator==(const String& s1) const
   {
     bool result = (this->len == s1.len);

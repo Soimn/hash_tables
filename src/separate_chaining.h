@@ -3,7 +3,7 @@ typedef struct SC_Table_Entry
   struct SC_Table_Entry* next;
   u64 hash;
   String key;
-  void* data;
+  u64 data;
 } SC_Table_Entry;
 
 typedef struct SC_Table
@@ -71,7 +71,7 @@ SC_Table__FindEntry(SC_Table* table, u64 hash, String key)
 }
 
 static bool
-SC_Table_Put(SC_Table* table, String key, void* data)
+SC_Table_Put(SC_Table* table, String key, u64 data)
 {
   u64 hash = table->hash_func(key);
   SC_Table_Entry** entry = SC_Table__FindEntry(table, hash, key);
@@ -97,7 +97,7 @@ SC_Table_Put(SC_Table* table, String key, void* data)
 }
 
 static bool
-SC_Table_Get(SC_Table* table, String key, void** data)
+SC_Table_Get(SC_Table* table, String key, u64* data)
 {
   u64 hash = table->hash_func(key);
   SC_Table_Entry* entry = *SC_Table__FindEntry(table, hash, key);
@@ -107,19 +107,5 @@ SC_Table_Get(SC_Table* table, String key, void** data)
   {
     *data = entry->data;
     return true;
-  }
-}
-
-static bool
-SC_Table_Remove(SC_Table* table, String key)
-{
-  u64 hash = table->hash_func(key);
-  SC_Table_Entry** entry = SC_Table__FindEntry(table, hash, key);
-
-  if (*entry == 0) return false;
-  else
-  {
-    *entry = (*entry)->next;
-    free(*entry);
   }
 }
