@@ -57,6 +57,9 @@ struct Variant_Data
     u64 entry_count;
   } rp;
 
+  u64 put_count;
+  u64 max_collision_len;
+
   Variant_Data() : strings(), um() {}
   ~Variant_Data() = default;
 };
@@ -122,7 +125,9 @@ typedef struct LP_Entry
 static void
 LP_Init(Variant_Data* data)
 {
-  data->lp.entry_count = 0;
+  data->lp.entry_count       = 0;
+  data->put_count         = 0;
+  data->max_collision_len = 0;
   data->lp.entries = (LP_Entry*)VirtualAlloc(0, LP_SIZE*sizeof(LP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
   
   if (data->lp.entries == 0)
@@ -142,10 +147,15 @@ LP_Put(Variant_Data* data, String s)
 
   u64 idx = hash & LP_MASK;
 
+  u64 collision_len = 0;
   while (data->lp.entries[idx].hash != 0)
   {
     if (data->lp.entries[idx].hash == hash && data->strings[data->lp.entries[idx].string_idx] == s) break;
-    else                                                                                            idx = (idx + 1) & LP_MASK;
+    else
+    {
+      idx = (idx + 1) & LP_MASK;
+      ++collision_len;
+    }
   }
 
   if (data->lp.entries[idx].hash == 0)
@@ -155,6 +165,9 @@ LP_Put(Variant_Data* data, String s)
     data->strings.push_back(s);
     data->lp.entry_count += 1;
   }
+
+  data->put_count += 1;
+  data->max_collision_len = (data->max_collision_len < collision_len ? collision_len : data->max_collision_len);
 }
 
 static u64
@@ -235,6 +248,8 @@ static void
 HP_Init(Variant_Data* data)
 {
   data->hp.entry_count = 0;
+  data->put_count = 0;
+  data->max_collision_len = 0;
   data->hp.entries = (HP_Entry*)VirtualAlloc(0, HP_SIZE*sizeof(HP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
   
   if (data->hp.entries == 0)
@@ -255,10 +270,15 @@ HP_Put(Variant_Data* data, String s)
   u64 idx  = hash & HP_MASK;
   u64 step = 1 + ((hash >> 24) & 0x3);
 
+  u64 collision_len = 0;
   while (data->hp.entries[idx].hash != 0)
   {
     if (data->hp.entries[idx].hash == hash && data->strings[data->hp.entries[idx].string_idx] == s) break;
-    else                                                                                            idx = (idx + step) & HP_MASK;
+    else
+    {
+      idx = (idx + step) & HP_MASK;
+      ++collision_len;
+    }
   }
 
   if (data->hp.entries[idx].hash == 0)
@@ -268,6 +288,9 @@ HP_Put(Variant_Data* data, String s)
     data->strings.push_back(s);
     data->hp.entry_count += 1;
   }
+
+  data->put_count += 1;
+  data->max_collision_len = (data->max_collision_len < collision_len ? collision_len : data->max_collision_len);
 }
 
 static u64
@@ -292,6 +315,8 @@ static void
 RP_Init(Variant_Data* data)
 {
   data->rp.entry_count = 0;
+  data->put_count = 0;
+  data->max_collision_len = 0;
   data->rp.entries = (RP_Entry*)VirtualAlloc(0, RP_SIZE*sizeof(RP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
   
   if (data->rp.entries == 0)
@@ -312,10 +337,15 @@ RP_Put(Variant_Data* data, String s)
   u64 idx  = hash & RP_MASK;
   u64 step_i = _rotr64(hash, RP_SIZE_LG2);
 
+  u64 collision_len = 0;
   while (data->rp.entries[idx].hash != 0)
   {
     if (data->rp.entries[idx].hash == hash && data->strings[data->rp.entries[idx].string_idx] == s) break;
-    else                                                                                            idx = (idx + 1 + ((step_i = _rotr64(step_i, 2))&0x3)) & RP_MASK;
+    else
+    {
+      idx = (idx + 1 + ((step_i = _rotr64(step_i, 2))&0x3)) & RP_MASK;
+      ++collision_len;
+    }
   }
 
   if (data->rp.entries[idx].hash == 0)
@@ -325,6 +355,9 @@ RP_Put(Variant_Data* data, String s)
     data->strings.push_back(s);
     data->rp.entry_count += 1;
   }
+
+  data->put_count += 1;
+  data->max_collision_len = (data->max_collision_len < collision_len ? collision_len : data->max_collision_len);
 }
 
 static u64
@@ -592,6 +625,7 @@ main(int argc, char** argv)
   }
 
   printf("Found %llu identifiers\n", variant.size(&data));
+  printf("%llu, %llu, %llu\n", data.put_count, variant.size(&data), data.max_collision_len);
 
   return 0;
 }
