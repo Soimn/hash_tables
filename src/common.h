@@ -65,6 +65,34 @@ public:
   }
 };
 
+static u64
+FNV1A(String s)
+{
+  u64 hash = 14695981039346656037;
+  for (u64 i = 0; i < s.len; ++i)
+  {
+    hash ^= s.data[i];
+    hash *= 1099511628211;
+  }
+
+  return hash;
+}
+
+static inline u64
+FNV1A_MapToIdx(u64 hash, u64 bits)
+{
+  return ((hash >> bits) ^ hash) & ((1ULL << bits)-1);
+}
+
+class String_Hash_FNV1A
+{
+public:
+  u64 operator()(const String& key) const
+  {
+    return FNV1A(key);
+  }
+};
+
 static bool
 Char_IsAlpha(u8 c)
 {

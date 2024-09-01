@@ -10,17 +10,20 @@
 
 #define USAGE_STR "Usage: hash_bench [variant number] [path to c/c++ code or header file]"
 
-#define MAX_STRING_COUNT (1ULL << 23)
+#define MAX_STRING_COUNT_LG2 23
+#define MAX_STRING_COUNT (1ULL << MAX_STRING_COUNT_LG2)
 
-void
+static void
 PreFault(void* base, u64 size)
 {
+#if 0
   u64 page_size = 1ULL << 14;
   __m256i zero = _mm256_setzero_si256();
   for (u64 i = 0; i < size; i += page_size)
   {
     _mm256_stream_si256((__m256i*)((u8*)base + i), zero);
   }
+#endif
 }
 
 struct Variant_Data
@@ -28,6 +31,7 @@ struct Variant_Data
   std::vector<String> strings;
 
   std::unordered_map<String, u32, String_Hash_XXH64, String_Eq> um;
+  std::unordered_map<String, u32, String_Hash_FNV1A, String_Eq> umfnv;
 
   struct
   {
@@ -112,9 +116,8 @@ typedef struct LP_Entry
   u32 string_idx;
 } LP_Entry;
 
-static_assert(MAX_STRING_COUNT != 0 && (MAX_STRING_COUNT & (MAX_STRING_COUNT-1)) == 0);
-#define LP_SIZE MAX_STRING_COUNT
-#define LP_MASK (MAX_STRING_COUNT-1)
+#define LP_SIZE (1ULL << MAX_STRING_COUNT_LG2)
+#define LP_MASK (LP_SIZE-1)
 
 static void
 LP_Init(Variant_Data* data)
@@ -168,9 +171,9 @@ typedef struct OA_Entry
   u32 string_idx;
 } OA_Entry;
 
-static_assert(MAX_STRING_COUNT != 0 && (MAX_STRING_COUNT & (MAX_STRING_COUNT-1)) == 0);
-#define OA_BUCKET_SIZE (1ULL << 14)
-#define OA_BUCKET_COUNT (MAX_STRING_COUNT/OA_BUCKET_SIZE)
+#define OA_BUCKET_SIZE_LG2 14
+#define OA_BUCKET_SIZE (1ULL << OA_BUCKET_SIZE_LG2)
+#define OA_BUCKET_COUNT (1ULL << (MAX_STRING_COUNT_LG2 - OA_BUCKET_SIZE_LG2))
 
 static void
 OA_Init(Variant_Data* data)
@@ -225,9 +228,8 @@ typedef struct HP_Entry
   u32 string_idx;
 } HP_Entry;
 
-static_assert(MAX_STRING_COUNT != 0 && (MAX_STRING_COUNT & (MAX_STRING_COUNT-1)) == 0);
-#define HP_SIZE MAX_STRING_COUNT
-#define HP_MASK (MAX_STRING_COUNT-1)
+#define HP_SIZE (1ULL << MAX_STRING_COUNT_LG2)
+#define HP_MASK (HP_SIZE-1)
 
 static void
 HP_Init(Variant_Data* data)
@@ -282,11 +284,9 @@ typedef struct RP_Entry
   u32 string_idx;
 } RP_Entry;
 
-static_assert(MAX_STRING_COUNT != 0 && (MAX_STRING_COUNT & (MAX_STRING_COUNT-1)) == 0);
-#define RP_SIZE_LG2 23
-static_assert(MAX_STRING_COUNT == 1ULL << RP_SIZE_LG2);
-#define RP_SIZE MAX_STRING_COUNT
-#define RP_MASK (MAX_STRING_COUNT-1)
+#define RP_SIZE_LG2 MAX_STRING_COUNT_LG2
+#define RP_SIZE (1ULL << RP_SIZE_LG2)
+#define RP_MASK (RP_SIZE-1)
 
 static void
 RP_Init(Variant_Data* data)
@@ -333,6 +333,182 @@ RP_Size(Variant_Data* data)
   return data->rp.entry_count;
 }
 
+// ----------------- UMFNV
+
+static void
+UMFNV_Init(Variant_Data* data)
+{
+  data->umfnv.reserve(MAX_STRING_COUNT);
+}
+
+static void
+UMFNV_Put(Variant_Data* data, String s)
+{
+  if (data->umfnv.find(s) == data->umfnv.end())
+  {
+    data->umfnv.emplace(s, (u32)data->strings.size());
+    data->strings.push_back(s);
+  }
+}
+
+static u64
+UMFNV_Size(Variant_Data* data)
+{
+  return data->umfnv.size();
+}
+
+// ----------------- LPFNV
+
+#define LPFNV_SIZE_LG2 MAX_STRING_COUNT_LG2
+#define LPFNV_SIZE (1ULL << LPFNV_SIZE_LG2)
+#define LPFNV_MASK (LPFNV_SIZE-1)
+
+static void
+LPFNV_Init(Variant_Data* data)
+{
+  data->lp.entry_count = 0;
+  data->lp.entries = (LP_Entry*)VirtualAlloc(0, LPFNV_SIZE*sizeof(LP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+  
+  if (data->lp.entries == 0)
+  {
+    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
+    ExitProcess(-1);
+  }
+
+  PreFault(data->lp.entries, LPFNV_SIZE*sizeof(LP_Entry));
+}
+
+static void
+LPFNV_Put(Variant_Data* data, String s)
+{
+  u64 hash = FNV1A(s);
+  if (hash == 0) hash = 1;
+
+  u64 idx = FNV1A_MapToIdx(hash, LPFNV_SIZE_LG2);
+
+  while (data->lp.entries[idx].hash != 0)
+  {
+    if (data->lp.entries[idx].hash == hash && data->strings[data->lp.entries[idx].string_idx] == s) break;
+    else                                                                                            idx = (idx + 1) & LPFNV_MASK;
+  }
+
+  if (data->lp.entries[idx].hash == 0)
+  {
+    data->lp.entries[idx].hash       = hash;
+    data->lp.entries[idx].string_idx = (u32)data->strings.size();
+    data->strings.push_back(s);
+    data->lp.entry_count += 1;
+  }
+}
+
+static u64
+LPFNV_Size(Variant_Data* data)
+{
+  return data->lp.entry_count;
+}
+
+// ----------------- HPFNV
+
+#define HPFNV_SIZE_LG2 MAX_STRING_COUNT_LG2
+#define HPFNV_SIZE (1ULL << HPFNV_SIZE_LG2)
+#define HPFNV_MASK (HPFNV_SIZE-1)
+
+static void
+HPFNV_Init(Variant_Data* data)
+{
+  data->hp.entry_count = 0;
+  data->hp.entries = (HP_Entry*)VirtualAlloc(0, HPFNV_SIZE*sizeof(HP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+  
+  if (data->hp.entries == 0)
+  {
+    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
+    ExitProcess(-1);
+  }
+
+  PreFault(data->hp.entries, HPFNV_SIZE*sizeof(HP_Entry));
+}
+
+static void
+HPFNV_Put(Variant_Data* data, String s)
+{
+  u64 hash = FNV1A(s);
+  if (hash == 0) hash = 1;
+
+  u64 idx = FNV1A_MapToIdx(hash, HPFNV_SIZE_LG2);
+  u64 step = 1 + ((hash >> 24) & 0x3);
+
+  while (data->hp.entries[idx].hash != 0)
+  {
+    if (data->hp.entries[idx].hash == hash && data->strings[data->hp.entries[idx].string_idx] == s) break;
+    else                                                                                            idx = (idx + step) & HPFNV_MASK;
+  }
+
+  if (data->hp.entries[idx].hash == 0)
+  {
+    data->hp.entries[idx].hash       = hash;
+    data->hp.entries[idx].string_idx = (u32)data->strings.size();
+    data->strings.push_back(s);
+    data->hp.entry_count += 1;
+  }
+}
+
+static u64
+HPFNV_Size(Variant_Data* data)
+{
+  return data->hp.entry_count;
+}
+
+// ----------------- RPFNV
+
+#define RPFNV_SIZE_LG2 MAX_STRING_COUNT_LG2
+#define RPFNV_SIZE (1ULL << RPFNV_SIZE_LG2)
+#define RPFNV_MASK (RPFNV_SIZE-1)
+
+static void
+RPFNV_Init(Variant_Data* data)
+{
+  data->rp.entry_count = 0;
+  data->rp.entries = (RP_Entry*)VirtualAlloc(0, RPFNV_SIZE*sizeof(RP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+  
+  if (data->rp.entries == 0)
+  {
+    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
+    ExitProcess(-1);
+  }
+
+  PreFault(data->rp.entries, RPFNV_SIZE*sizeof(RP_Entry));
+}
+
+static void
+RPFNV_Put(Variant_Data* data, String s)
+{
+  u64 hash = FNV1A(s);
+  if (hash == 0) hash = 1;
+
+  u64 idx = FNV1A_MapToIdx(hash, RPFNV_SIZE_LG2);
+  u64 step_i = _rotr64(hash, RPFNV_SIZE_LG2);
+
+  while (data->rp.entries[idx].hash != 0)
+  {
+    if (data->rp.entries[idx].hash == hash && data->strings[data->rp.entries[idx].string_idx] == s) break;
+    else                                                                                            idx = (idx + 1 + ((step_i = _rotr64(step_i, 2))&0x3)) & RPFNV_MASK;
+  }
+
+  if (data->rp.entries[idx].hash == 0)
+  {
+    data->rp.entries[idx].hash       = hash;
+    data->rp.entries[idx].string_idx = (u32)data->strings.size();
+    data->strings.push_back(s);
+    data->rp.entry_count += 1;
+  }
+}
+
+static u64
+RPFNV_Size(Variant_Data* data)
+{
+  return data->rp.entry_count;
+}
+
 Variant Variants[] = {
   { STUB_Init, STUB_Put, STUB_Size },
   { UM_Init, UM_Put, UM_Size },
@@ -340,6 +516,10 @@ Variant Variants[] = {
   { OA_Init, OA_Put, OA_Size },
   { HP_Init, HP_Put, HP_Size },
   { RP_Init, RP_Put, RP_Size },
+  { UMFNV_Init, UMFNV_Put, UMFNV_Size },
+  { LPFNV_Init, LPFNV_Put, LPFNV_Size },
+  { HPFNV_Init, HPFNV_Put, HPFNV_Size },
+  { RPFNV_Init, RPFNV_Put, RPFNV_Size },
 };
 
 int
