@@ -58,6 +58,7 @@ struct Variant_Data
   } rp;
 
   u64 put_count;
+  u64 collisions;
   u64 max_collision_len;
 
   Variant_Data() : strings(), um() {}
@@ -125,9 +126,10 @@ typedef struct LP_Entry
 static void
 LP_Init(Variant_Data* data)
 {
-  data->lp.entry_count       = 0;
+  data->lp.entry_count    = 0;
   data->put_count         = 0;
   data->max_collision_len = 0;
+  data->collisions        = 0;
   data->lp.entries = (LP_Entry*)VirtualAlloc(0, LP_SIZE*sizeof(LP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
   
   if (data->lp.entries == 0)
@@ -143,9 +145,13 @@ static void
 LP_Put(Variant_Data* data, String s)
 {
   u64 hash = XXH3_64bits(s.data, s.len);
-  if (hash == 0) hash = 1;
-
+  //hash |= 1; - 10086893 collisions
+  //hash |= 0x7FFFFF; // - 4272790147541544589 collisions reported before I killed it
+  //if (hash == 0) hash = 1; // - 6702433 collisions
   u64 idx = hash & LP_MASK;
+  //hash |= 1; - 6702433 collisions
+  //hash |= 0x7FFFFF; // - 6702433 collisions
+  if (hash == 0) hash = 1; // - 6702433 collisions
 
   u64 collision_len = 0;
   while (data->lp.entries[idx].hash != 0)
@@ -167,6 +173,7 @@ LP_Put(Variant_Data* data, String s)
   }
 
   data->put_count += 1;
+  data->collisions += (collision_len != 0);
   data->max_collision_len = (data->max_collision_len < collision_len ? collision_len : data->max_collision_len);
 }
 
@@ -335,7 +342,7 @@ RP_Put(Variant_Data* data, String s)
   if (hash == 0) hash = 1;
 
   u64 idx  = hash & RP_MASK;
-  u64 step_i = _rotr64(hash, RP_SIZE_LG2);
+  u64 step = 1;
 
   u64 collision_len = 0;
   while (data->rp.entries[idx].hash != 0)
@@ -343,7 +350,8 @@ RP_Put(Variant_Data* data, String s)
     if (data->rp.entries[idx].hash == hash && data->strings[data->rp.entries[idx].string_idx] == s) break;
     else
     {
-      idx = (idx + 1 + ((step_i = _rotr64(step_i, 2))&0x3)) & RP_MASK;
+      idx = (idx + step) & RP_MASK;
+      ++step;
       ++collision_len;
     }
   }
@@ -592,7 +600,7 @@ main(int argc, char** argv)
 
   u64 start_rdtsc = __rdtsc();
   u64 watermark = 0;
-  printf("%llu, %llu\n", 0ULL, __rdtsc() - start_rdtsc);
+  //printf("%llu, %llu\n", 0ULL, __rdtsc() - start_rdtsc);
 
   for (;;)
   {
@@ -600,7 +608,7 @@ main(int argc, char** argv)
     if (sz > watermark && sz % 10000 == 0)
     {
       watermark = sz;
-      printf("%llu, %llu\n", sz, __rdtsc() - start_rdtsc);
+      //printf("%llu, %llu\n", sz, __rdtsc() - start_rdtsc);
     }
 
     for (;;)
@@ -625,7 +633,7 @@ main(int argc, char** argv)
   }
 
   printf("Found %llu identifiers\n", variant.size(&data));
-  printf("%llu, %llu, %llu\n", data.put_count, variant.size(&data), data.max_collision_len);
+  printf("%llu, %llu, %llu (%llu)\n", data.put_count, variant.size(&data), data.max_collision_len, data.collisions);
 
   return 0;
 }
