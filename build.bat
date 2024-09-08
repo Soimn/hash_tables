@@ -27,7 +27,7 @@ if "%1"=="debug" (
 
 if "%2" neq "" goto invalid_arguments
 
-cl %compile_options% /EHsc ..\src\main.cpp /link %link_options% /pdb:hash_bench.pdb /out:hash_bench.exe
+cl %compile_options% /std:c++17 /EHsc ..\src\main.cpp /link %link_options% /pdb:hash_bench.pdb /out:hash_bench.exe
 
 goto end
 

@@ -1,639 +1,1704 @@
+// I really wish C had proper metaprogramming, because this is getting ridiculous
+
 #include <windows.h>
 #include <stdio.h>
 #include <unordered_map>
 #include <vector>
 
+#include <vendor/ankerl/unordered_dense.h>
+
 #define XXH_INLINE_ALL
 #include "vendor/xxhash/xxhash.h"
 
-#include "common.h"
+typedef signed __int8  s8;
+typedef signed __int16 s16;
+typedef signed __int32 s32;
+typedef signed __int64 s64;
 
-#define USAGE_STR "Usage: hash_bench [variant number] [path to c/c++ code or header file]"
+typedef unsigned __int8  u8;
+typedef unsigned __int16 u16;
+typedef unsigned __int32 u32;
+typedef unsigned __int64 u64;
+
+typedef float f32;
+typedef double f64;
+
+#define ARRAY_SIZE(A) (sizeof(A)/sizeof(0[A]))
+
+#define USE_SSO 0
+#define USE_FNV1A 0
+
+#if !USE_SSO
+struct String
+{
+  u64 len;
+  u8* data;
+
+  String(u8* data, u64 len)
+  {
+    this->data = data;
+    this->len  = len;
+  }
+
+  u16 Prefix() const
+  {
+    u16 result;
+    if      (this->len > 1) result = *(u16*)this->data;
+    else if (this->len > 0) result = this->data[0];
+    else                    result = 0;
+    return result;
+  }
+
+  u64 Hash() const
+  {
+    u64 len  = this->len;
+    u8* data = this->data;
+    
+#if USE_FNV1A
+    return FNV1A(data, len);
+#else
+    return XXH3_64bits(data, len);
+#endif
+  }
+
+  bool operator == (const String& s1) const
+  {
+    bool result = (this->len == s1.len);
+
+    for (u64 i = 0; i < this->len && result; ++i)
+    {
+      result = (this->data[i] == s1.data[i]);
+    }
+
+    return result;
+  }
+};
+#else
+struct String
+{
+  u64 len;
+  u8* data;
+
+  String(u8* data, u64 len)
+  {
+    if (len <= 16)
+    {
+      this->len  = 0;
+      this->data = 0;
+      memcpy(&this->len, data, 8);
+      memcpy(&this->data, data + 8, 8);
+      this->len |= (1ULL << 63);
+    }
+    else
+    {
+      this->data = data;
+      this->len  = len;
+    }
+  }
+
+  u64 Hash() const
+  {
+    u64 len  = this->len;
+    u8* data = this->data;
+    if ((s64)this->len < 0)
+    {
+      len = 16;
+      data = (u8*)&this->len;
+    }
+    
+#if USE_FNV1A
+    return FNV1A(data, len);
+#else
+    return XXH3_64bits(data, len);
+#endif
+  }
+
+  bool operator == (const String& s1) const
+  {
+    if ((s64)this->len < 0 && (s64)s1.len < 0)
+    {
+      return (this->len == s1.len && this->data == s1.data);
+    }
+    else
+    {
+      u64 s0_len  = this->len;
+      u8* s0_data = this->data;
+      if ((s64)this->len < 0)
+      {
+        s0_len = 16;
+        s0_data = (u8*)&this->len;
+      }
+
+      u64 s1_len  = s1.len;
+      u8* s1_data = s1.data;
+      if ((s64)s1.len < 0)
+      {
+        s1_len = 16;
+        s1_data = (u8*)&s1.len;
+      }
+
+      bool result = (s0_len == s1_len && (s0_data[0]&0x7F) == (s1_data[0]&0x7F));
+
+      for (u64 i = 1; i < s0_len && result; ++i)
+      {
+        result = (s0_data[i] == s1_data[i]);
+      }
+
+      return result;
+    }
+  }
+};
+#endif
+
+static u64
+FNV1A(u8* data, u64 len)
+{
+  u64 hash = 14695981039346656037;
+  for (u64 i = 0; i < len; ++i)
+  {
+    hash ^= data[i];
+    hash *= 1099511628211;
+  }
+
+  return hash;
+}
+
+static inline u64
+FNV1A_MapToIdx(u64 hash, u64 bits)
+{
+  return ((hash >> bits) ^ hash) & ((1ULL << bits)-1);
+}
+
+template <>
+struct ankerl::unordered_dense::hash<String>
+{
+  using is_avalanching = void;
+
+  [[nodiscard]] auto operator () (const String& s) const noexcept -> u64
+  {
+    return s.Hash();
+  }
+};
+
+static bool
+Char_IsAlpha(u8 c)
+{
+  return ((u8)((c&0xDF) - 'A') <= (u8)('Z' - 'A'));
+}
+
+static bool
+Char_IsDigit(u8 c)
+{
+  return ((u8)(c - '0') < (u8)10);
+}
+
+#define TOKEN_KIND__BLOCK_SIZE_LG2 6
+#define TOKEN_KIND__BLOCK(N) ((N) << TOKEN_KIND__BLOCK_SIZE_LG2)
+#define TOKEN_KIND__BLOCK_IDX(N) ((N) >> TOKEN_KIND__BLOCK_SIZE_LG2)
+#define TOKEN_KIND__ASS_BIT TOKEN_KIND__BLOCK(8)
+
+#define TOKEN_KIND__IS_BINARY(K) ((u32)((K) - Token__FirstBinary) <= (u32)(Token__PastLastBinary - Token__FirstBinary))
+#define TOKEN_KIND__IS_BINARY_ASSIGNMENT(K) ((u32)((K) - Token__FirstAssignment) <= (u32)(Token__PastLastAssignment - Token__FirstAssignment))
+
+typedef enum Token_Kind
+{
+  Token_Error = 0,
+  Token_Invalid,
+  Token_EOF,
+
+  Token_Mul = TOKEN_KIND__BLOCK(3),                       // *
+  Token__FirstBinary = Token_Mul,
+  Token__FirstMulLevel = Token__FirstBinary,
+  Token_Div,                                              // /
+  Token_Rem,                                              // %
+  Token_And,                                              // &
+  Token_Shl,                                              // <<
+  Token_Shr,                                              // >>
+  Token__PastLastMulLevel,
+
+  Token_Add = TOKEN_KIND__BLOCK(4),                       // +
+  Token__FirstAddLevel = Token_Add,
+  Token_Sub,                                              // -
+  Token_Or,                                               // |
+  Token_Xor,                                              // ~
+  Token__PastLastAddLevel,
+
+  Token_EQEQ = TOKEN_KIND__BLOCK(5),                      // ==
+  Token__FirstCmpLevel = Token_EQEQ,
+  Token_LNotEQ,                                           // !=
+  Token_Le,                                               // <
+  Token_LeEQ,                                             // <=
+  Token_Ge,                                               // >
+  Token_GeEQ,                                             // >=
+  Token__PastLastCmpLevel,
+
+  Token_LAnd = TOKEN_KIND__BLOCK(6),                      // &&
+  Token__FirstLAndLevel = Token_LAnd,
+  Token__PastLastLAndLevel,
+
+  Token_LOr = TOKEN_KIND__BLOCK(7),                       // ||
+  Token__FirstLOrLevel = Token_LOr,
+  Token__PastLastLOrLevel,
+  Token__PastLastBinary = Token__PastLastLOrLevel,
+
+  Token_MulEQ = TOKEN_KIND__BLOCK(8 + 3),                 // *=
+  Token__FirstAssignment = Token_MulEQ,
+  Token__FirstMulLevelAssignment = Token__FirstAssignment,
+  Token_DivEQ,                                            // /=
+  Token_RemEQ,                                            // %=
+  Token_AndEQ,                                            // &=
+  Token_ShlEQ,                                            // <<=
+  Token_ShrEQ,                                            // >>=
+  Token__PastLastMulLevelAssignment,
+
+  Token_AddEQ = TOKEN_KIND__BLOCK(8 + 4),                 // +=
+  Token__FirstAddLevelAssignment = Token_AddEQ,
+  Token_SubEQ,                                            // -=
+  Token_OrEQ,                                             // |=
+  Token_XorEQ,                                            // ~=
+  Token__PastLastAddLevelAssignment,
+
+  Token_EQ,                                               // =
+  Token__PastLastAssignment,
+
+  Token_LNot,                                             // !
+  Token_Cash,                                             // $
+  Token_QMark,                                            // ?
+  Token_Colon,                                            // :
+  Token_Comma,                                            // ,
+  Token_Semicolon,                                        // ;
+  Token_Hat,                                              // ^
+  Token_OpenParen,                                        // (
+  Token_CloseParen,                                       // )
+  Token_OpenBracket,                                      // [
+  Token_CloseBracket,                                     // ]
+  Token_OpenBrace,                                        // {
+  Token_CloseBrace,                                       // }
+  Token_Dot,                                              // .
+  Token_Pound,                                            // #
+
+  Token_Ident,
+  Token_String,
+  Token_Char,
+  Token_Int,
+} Token_Kind;
+
+typedef struct Token
+{
+  Token_Kind kind;
+  u32 offset;
+  u32 len;
+  u32 line;
+  u32 col;
+
+  union
+  {
+    u64 integer;
+    f64 floating;
+    String string;
+  };
+} Token;
+
+typedef struct Lexer
+{
+  u8* input;
+  u8* cursor;
+  u8* start_of_line;
+  u32 line;
+  Token token;
+} Lexer;
+
+static bool
+Lexer_Init(char* filename, Lexer* lexer)
+{
+  *lexer = {
+    0,
+    0,
+    0,
+    1,
+    { Token_Invalid },
+  };
+
+  HANDLE file = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+  LARGE_INTEGER size;
+
+  if (file != INVALID_HANDLE_VALUE && GetFileSizeEx(file, &size) && size.HighPart == 0)
+  {
+    lexer->input = (u8*)VirtualAlloc(0, size.LowPart + 1, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+
+    DWORD read_bytes = 0;
+    if (lexer->input != 0 && ReadFile(file, lexer->input, size.LowPart, &read_bytes, 0) && read_bytes == size.LowPart)
+    {
+      lexer->input[size.LowPart] = 0;
+
+      lexer->cursor        = lexer->input;
+      lexer->start_of_line = lexer->input;
+      lexer->token         = { Token_Invalid };
+    }
+  }
+
+  CloseHandle(file);
+
+  return lexer;
+}
+
+static void
+Lexer_Reset(Lexer* lexer)
+{
+  lexer->cursor        = lexer->input;
+  lexer->start_of_line = lexer->input;
+  lexer->token         = { Token_Invalid };
+}
+
+static Token
+Lexer_NextToken(Lexer* lexer)
+{
+  if (lexer->token.kind == Token_Error || lexer->token.kind == Token_EOF) return lexer->token;
+
+  Token token = { Token_Error };
+
+  bool encountered_errors = false;
+
+  for (;;)
+  {
+    // NOTE: All characters in the range [0x1, 0x20] are considered whitespace
+    while ((u8)(*lexer->cursor-1) < (u8)0x20)
+    {
+      if (*lexer->cursor == '\n')
+      {
+        lexer->line         += 1;
+        lexer->start_of_line = lexer->cursor + 1;
+      }
+
+      ++lexer->cursor;
+    }
+
+    if (lexer->cursor[0] == '/' && lexer->cursor[1] == '/')
+    {
+      lexer->cursor += 2;
+      while (*lexer->cursor != 0 && *lexer->cursor != '\n') ++lexer->cursor;
+    }
+    else if (lexer->cursor[0] == '/' && lexer->cursor[1] == '*')
+    {
+      lexer->cursor += 2;
+      while (lexer->cursor[0] != 0 && !(lexer->cursor[0] == '*' && lexer->cursor[1] == '/'))
+      {
+        if (*lexer->cursor == '\n')
+        {
+          lexer->line         += 1;
+          lexer->start_of_line = lexer->cursor + 1;
+        }
+
+        ++lexer->cursor;
+      }
+    }
+    else break;
+  }
+
+  u8* start_of_token = lexer->cursor;
+
+  if (*lexer->cursor == 0) token.kind = Token_EOF;
+  else
+  {
+    u8 c = *lexer->cursor;
+    lexer->cursor += 1;
+
+    u8 c1_eq      = (*lexer->cursor == '=');
+    u32 c1_eq_bit = (*lexer->cursor == '=' ? TOKEN_KIND__ASS_BIT : 0);
+
+    switch (c)
+    {
+			case '$': token.kind = Token_Cash;         break;
+			case '?': token.kind = Token_QMark;        break;
+			case ':': token.kind = Token_Colon;        break;
+			case ',': token.kind = Token_Comma;        break;
+			case ';': token.kind = Token_Semicolon;    break;
+			case '^': token.kind = Token_Hat;          break;
+			case '(': token.kind = Token_OpenParen;    break;
+			case ')': token.kind = Token_CloseParen;   break;
+			case '[': token.kind = Token_OpenBracket;  break;
+			case ']': token.kind = Token_CloseBracket; break;
+			case '{': token.kind = Token_OpenBrace;    break;
+			case '}': token.kind = Token_CloseBrace;   break;
+			case '.': token.kind = Token_Dot;          break;
+			case '#': token.kind = Token_Pound;        break;
+
+      case '*': { token.kind = (Token_Kind)(Token_Mul | c1_eq_bit); lexer->cursor += c1_eq; } break;
+      case '/': { token.kind = (Token_Kind)(Token_Div | c1_eq_bit); lexer->cursor += c1_eq; } break;
+      case '%': { token.kind = (Token_Kind)(Token_Rem | c1_eq_bit); lexer->cursor += c1_eq; } break;
+      case '~': { token.kind = (Token_Kind)(Token_Xor | c1_eq_bit); lexer->cursor += c1_eq; } break;
+      case '+': { token.kind = (Token_Kind)(Token_Add | c1_eq_bit); lexer->cursor += c1_eq; } break;
+      case '-': { token.kind = (Token_Kind)(Token_Sub | c1_eq_bit); lexer->cursor += c1_eq; } break;
+
+      case '=':
+      {
+        token.kind     = (c1_eq ? Token_EQEQ : Token_EQ);
+        lexer->cursor += c1_eq;
+      } break;
+
+      case '!':
+      {
+        token.kind     = (c1_eq ? Token_LNotEQ : Token_LNot);
+        lexer->cursor += c1_eq;
+      } break;
+
+      case '&':
+      {
+        if (lexer->cursor[0] == '&')
+        {
+          token.kind     = Token_LAnd;
+          lexer->cursor += 1;
+        }
+        else
+        {
+          token.kind     = (Token_Kind)(Token_And | c1_eq_bit);
+          lexer->cursor += c1_eq;
+        }
+      } break;
+
+      case '|':
+      {
+        if (lexer->cursor[0] == '|')
+        {
+          token.kind     = Token_LOr;
+          lexer->cursor += 1;
+        }
+        else
+        {
+          token.kind     = (Token_Kind)(Token_Or | c1_eq_bit);
+          lexer->cursor += c1_eq;
+        }
+      } break;
+
+      case '<':
+      {
+        if (lexer->cursor[0] == '<')
+        {
+          if (lexer->cursor[1] == '=')
+          {
+            token.kind = Token_ShlEQ;
+            lexer->cursor += 2;
+          }
+          else
+          {
+            token.kind = Token_Shl;
+            lexer->cursor += 1;
+          }
+        }
+        else
+        {
+          token.kind     = (Token_Kind)(Token_Le + c1_eq);
+          lexer->cursor += c1_eq;
+        }
+      } break;
+
+      case '>':
+      {
+        if (lexer->cursor[0] == '>')
+        {
+          if (lexer->cursor[1] == '=')
+          {
+            token.kind = Token_ShrEQ;
+            lexer->cursor += 2;
+          }
+          else
+          {
+            token.kind = Token_Shr;
+            lexer->cursor += 1;
+          }
+        }
+        else
+        {
+          token.kind     = (Token_Kind)(Token_Ge + c1_eq);
+          lexer->cursor += c1_eq;
+        }
+      } break;
+
+      default:
+      {
+        if (c == '_' || Char_IsAlpha(c))
+        {
+          while (*lexer->cursor == '_' || Char_IsAlpha(*lexer->cursor) || Char_IsDigit(*lexer->cursor)) ++lexer->cursor;
+
+          String ident_string(start_of_token, lexer->cursor - start_of_token);
+
+          token.kind   = Token_Ident;
+          token.string = ident_string;
+        }
+        else if (Char_IsDigit(c))
+        {
+          u64 base    = 10;
+          u64 integer = c & 0xF;
+
+          if (c == '0' && (*lexer->cursor&0xDF) == 'X')
+          {
+            base        = 16;
+            integer     = 0;
+            ++lexer->cursor;
+          }
+          else if (c == '0')
+          {
+            base = 8;
+          }
+
+          for (;;)
+          {
+            u64 digit = 0;
+            if      (Char_IsDigit(*lexer->cursor) && (*lexer->cursor&0xF) < base)        digit = *lexer->cursor & 0xF;
+            else if (base == 16 && (u8)((*lexer->cursor&0xDF) - 'A') <= (u8)('F' - 'A')) digit = 9 + (*lexer->cursor & 0x7);
+            else break;
+
+            integer = integer*base + digit;
+            ++lexer->cursor;
+          }
+
+          if      ((lexer->cursor[0]&0xDF) == 'U' && (lexer->cursor[1]&0xDF) == 'L' && (lexer->cursor[2]&0xDF) == 'L') lexer->cursor += 3;
+          else if ((lexer->cursor[0]&0xDF) == 'U' && (lexer->cursor[1]&0xDF) == 'L')                                   lexer->cursor += 2;
+          else if ((lexer->cursor[0]&0xDF) == 'U')                                                                     lexer->cursor += 1;
+          else if ((lexer->cursor[0]&0xDF) == 'L' && (lexer->cursor[1]&0xDF) == 'L' && (lexer->cursor[2]&0xDF) == 'U') lexer->cursor += 3;
+          else if ((lexer->cursor[0]&0xDF) == 'L' && (lexer->cursor[1]&0xDF) == 'U')                                   lexer->cursor += 2;
+          else if ((lexer->cursor[0]&0xDF) == 'L')                                                                     lexer->cursor += 1;
+
+          token.kind    = Token_Int;
+          token.integer = integer;
+        }
+        else if (c == '"' || c == '\'')
+        {
+          while (*lexer->cursor != 0 && *lexer->cursor != c)
+          {
+            if (lexer->cursor[0] == '\\' && lexer->cursor[1] != 0) lexer->cursor += 2;
+            else                                                   lexer->cursor += 1;
+          }
+
+          if (*lexer->cursor == 0)
+          {
+            fprintf(stderr, "Unterminated string\n");
+            ExitProcess(-1);
+          }
+
+          String string(start_of_token, lexer->cursor - (start_of_token+1));
+          lexer->cursor += 1;
+
+          token.kind   = Token_String;
+          token.string = string;
+        }
+        else
+        {
+          token.kind = Token_Invalid;
+        }
+      } break;
+    }
+  }
+
+  token.offset   = (u32)(start_of_token - lexer->input);
+  token.len      = (u32)(lexer->cursor - start_of_token);
+  token.line     = lexer->line;
+  token.col      = (u32)(start_of_token - lexer->start_of_line) + 1;
+
+  if (encountered_errors) token.kind = Token_Error;
+
+  lexer->token = token;
+
+  return token;
+}
 
 #define MAX_STRING_COUNT_LG2 23
-#define MAX_STRING_COUNT (1ULL << MAX_STRING_COUNT_LG2)
+#define MAX_STRING_COUNT (1ULL << 23)
 
-static void
-PreFault(void* base, u64 size)
-{
-#if 0
-  u64 page_size = 1ULL << 14;
-  __m256i zero = _mm256_setzero_si256();
-  for (u64 i = 0; i < size; i += page_size)
-  {
-    _mm256_stream_si256((__m256i*)((u8*)base + i), zero);
-  }
-#endif
-}
-
-struct Variant_Data
-{
-  std::vector<String> strings;
-
-  std::unordered_map<String, u32, String_Hash_XXH64, String_Eq> um;
-  std::unordered_map<String, u32, String_Hash_FNV1A, String_Eq> umfnv;
-
-  struct
-  {
-    struct LP_Entry* entries;
-    u64 entry_count;
-  } lp;
-
-  struct
-  {
-    struct OA_Entry* entries;
-    u64 entry_count;
-  } oa;
-
-  struct
-  {
-    struct HP_Entry* entries;
-    u64 entry_count;
-  } hp;
-
-  struct
-  {
-    struct RP_Entry* entries;
-    u64 entry_count;
-  } rp;
-
-  u64 put_count;
-  u64 collisions;
-  u64 max_collision_len;
-
-  Variant_Data() : strings(), um() {}
-  ~Variant_Data() = default;
-};
-
-typedef struct Variant
-{
-  void (*init)(Variant_Data* data);
-  void (*put)(Variant_Data* data, String s);
-  u64 (*size)(Variant_Data* data);
-} Variant;
-
-static void
-STUB_Init(Variant_Data* data)
-{
-}
-
-static void
-STUB_Put(Variant_Data* data, String s)
-{
-}
-
-static u64
-STUB_Size(Variant_Data* data)
-{
-  return 0;
-}
-
-// ----------------- UM
-
-static void
-UM_Init(Variant_Data* data)
-{
-  data->um.reserve(MAX_STRING_COUNT);
-}
-
-static void
-UM_Put(Variant_Data* data, String s)
-{
-  if (data->um.find(s) == data->um.end())
-  {
-    data->um.emplace(s, (u32)data->strings.size());
-    data->strings.push_back(s);
-  }
-}
-
-static u64
-UM_Size(Variant_Data* data)
-{
-  return data->um.size();
-}
-
-// ----------------- LP
-
-typedef struct LP_Entry
+typedef struct LP__Entry
 {
   u64 hash;
-  u32 string_idx;
-} LP_Entry;
+  u32 id;
+  String string;
+} LP__Entry;
 
-#define LP_SIZE (1ULL << MAX_STRING_COUNT_LG2)
-#define LP_MASK (LP_SIZE-1)
-
-static void
-LP_Init(Variant_Data* data)
+typedef struct LP_Table
 {
-  data->lp.entry_count    = 0;
-  data->put_count         = 0;
-  data->max_collision_len = 0;
-  data->collisions        = 0;
-  data->lp.entries = (LP_Entry*)VirtualAlloc(0, LP_SIZE*sizeof(LP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-  
-  if (data->lp.entries == 0)
-  {
-    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
-    ExitProcess(-1);
-  }
+  u32 table_mask;
+  u32 entry_count;
+  LP__Entry* entries;
+} LP_Table;
 
-  PreFault(data->lp.entries, LP_SIZE*sizeof(LP_Entry));
+static LP_Table
+LP_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  LP__Entry* entries = (LP__Entry*)VirtualAlloc(0, table_size*sizeof(LP__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries };
 }
 
 static void
-LP_Put(Variant_Data* data, String s)
+LP_Destroy(LP_Table* table)
 {
-  u64 hash = XXH3_64bits(s.data, s.len);
-  //hash |= 1; - 10086893 collisions
-  //hash |= 0x7FFFFF; // - 4272790147541544589 collisions reported before I killed it
-  //if (hash == 0) hash = 1; // - 6702433 collisions
-  u64 idx = hash & LP_MASK;
-  //hash |= 1; - 6702433 collisions
-  //hash |= 0x7FFFFF; // - 6702433 collisions
-  if (hash == 0) hash = 1; // - 6702433 collisions
-
-  u64 collision_len = 0;
-  while (data->lp.entries[idx].hash != 0)
-  {
-    if (data->lp.entries[idx].hash == hash && data->strings[data->lp.entries[idx].string_idx] == s) break;
-    else
-    {
-      idx = (idx + 1) & LP_MASK;
-      ++collision_len;
-    }
-  }
-
-  if (data->lp.entries[idx].hash == 0)
-  {
-    data->lp.entries[idx].hash       = hash;
-    data->lp.entries[idx].string_idx = (u32)data->strings.size();
-    data->strings.push_back(s);
-    data->lp.entry_count += 1;
-  }
-
-  data->put_count += 1;
-  data->collisions += (collision_len != 0);
-  data->max_collision_len = (data->max_collision_len < collision_len ? collision_len : data->max_collision_len);
-}
-
-static u64
-LP_Size(Variant_Data* data)
-{
-  return data->lp.entry_count;
-}
-
-// ----------------- OA
-
-typedef struct OA_Entry
-{
-  u64 hash;
-  u32 string_idx;
-} OA_Entry;
-
-#define OA_BUCKET_SIZE_LG2 14
-#define OA_BUCKET_SIZE (1ULL << OA_BUCKET_SIZE_LG2)
-#define OA_BUCKET_COUNT (1ULL << (MAX_STRING_COUNT_LG2 - OA_BUCKET_SIZE_LG2))
-
-static void
-OA_Init(Variant_Data* data)
-{
-  data->oa.entry_count = 0;
-  data->oa.entries = (OA_Entry*)VirtualAlloc(0, OA_BUCKET_SIZE*OA_BUCKET_COUNT*sizeof(OA_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-  
-  if (data->oa.entries == 0)
-  {
-    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
-    ExitProcess(-1);
-  }
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  *table = {};
 }
 
 static void
-OA_Put(Variant_Data* data, String s)
+LP_Clear(LP_Table* table)
 {
-  u64 hash = XXH3_64bits(s.data, s.len);
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(LP__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+LP_Put(LP_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+
   if (hash == 0) hash = 1;
 
-  u64 bucket_idx = hash & (OA_BUCKET_COUNT-1);
-
-  u64 idx = bucket_idx * OA_BUCKET_SIZE;
-
-  for (; data->oa.entries[idx].hash != 0 && idx < (bucket_idx+1)*OA_BUCKET_SIZE; ++idx)
+  while (table->entries[idx].hash != 0)
   {
-    if (data->oa.entries[idx].hash == hash && data->strings[data->oa.entries[idx].string_idx] == s) break;
+    if (table->entries[idx].hash == hash && table->entries[idx].string == s) break;
+    idx += 1;
+    if (idx > table->table_mask) idx = 0;
   }
 
-  if (idx == (bucket_idx+1)*OA_BUCKET_SIZE) ExitProcess(-1);
-
-  if (data->oa.entries[idx].hash == 0)
+  if (table->entries[idx].hash == 0)
   {
-    data->oa.entries[idx].hash       = hash;
-    data->oa.entries[idx].string_idx = (u32)data->strings.size();
-    data->strings.push_back(s);
-    data->oa.entry_count += 1;
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+      s,
+    };
+
+    table->entry_count += 1;
   }
+
+  return table->entries[idx].id;
 }
 
-static u64
-OA_Size(Variant_Data* data)
-{
-  return data->oa.entry_count;
-}
-
-// ----------------- HP
-
-typedef struct HP_Entry
+typedef struct QP__Entry
 {
   u64 hash;
-  u32 string_idx;
-} HP_Entry;
+  u32 id;
+  String string;
+} QP__Entry;
 
-#define HP_SIZE (1ULL << MAX_STRING_COUNT_LG2)
-#define HP_MASK (HP_SIZE-1)
-
-static void
-HP_Init(Variant_Data* data)
+typedef struct QP_Table
 {
-  data->hp.entry_count = 0;
-  data->put_count = 0;
-  data->max_collision_len = 0;
-  data->hp.entries = (HP_Entry*)VirtualAlloc(0, HP_SIZE*sizeof(HP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-  
-  if (data->hp.entries == 0)
-  {
-    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
-    ExitProcess(-1);
-  }
+  u32 table_mask;
+  u32 entry_count;
+  QP__Entry* entries;
+} QP_Table;
 
-  PreFault(data->hp.entries, HP_SIZE*sizeof(HP_Entry));
+static QP_Table
+QP_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  QP__Entry* entries = (QP__Entry*)VirtualAlloc(0, table_size*sizeof(QP__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries };
 }
 
 static void
-HP_Put(Variant_Data* data, String s)
+QP_Destroy(QP_Table* table)
 {
-  u64 hash = XXH3_64bits(s.data, s.len);
-  if (hash == 0) hash = 1;
-
-  u64 idx  = hash & HP_MASK;
-  u64 step = 1 + ((hash >> 24) & 0x3);
-
-  u64 collision_len = 0;
-  while (data->hp.entries[idx].hash != 0)
-  {
-    if (data->hp.entries[idx].hash == hash && data->strings[data->hp.entries[idx].string_idx] == s) break;
-    else
-    {
-      idx = (idx + step) & HP_MASK;
-      ++collision_len;
-    }
-  }
-
-  if (data->hp.entries[idx].hash == 0)
-  {
-    data->hp.entries[idx].hash       = hash;
-    data->hp.entries[idx].string_idx = (u32)data->strings.size();
-    data->strings.push_back(s);
-    data->hp.entry_count += 1;
-  }
-
-  data->put_count += 1;
-  data->max_collision_len = (data->max_collision_len < collision_len ? collision_len : data->max_collision_len);
-}
-
-static u64
-HP_Size(Variant_Data* data)
-{
-  return data->hp.entry_count;
-}
-
-// ----------------- RP
-
-typedef struct RP_Entry
-{
-  u64 hash;
-  u32 string_idx;
-} RP_Entry;
-
-#define RP_SIZE_LG2 MAX_STRING_COUNT_LG2
-#define RP_SIZE (1ULL << RP_SIZE_LG2)
-#define RP_MASK (RP_SIZE-1)
-
-static void
-RP_Init(Variant_Data* data)
-{
-  data->rp.entry_count = 0;
-  data->put_count = 0;
-  data->max_collision_len = 0;
-  data->rp.entries = (RP_Entry*)VirtualAlloc(0, RP_SIZE*sizeof(RP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-  
-  if (data->rp.entries == 0)
-  {
-    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
-    ExitProcess(-1);
-  }
-
-  PreFault(data->rp.entries, RP_SIZE*sizeof(RP_Entry));
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  *table = {};
 }
 
 static void
-RP_Put(Variant_Data* data, String s)
+QP_Clear(QP_Table* table)
 {
-  u64 hash = XXH3_64bits(s.data, s.len);
-  if (hash == 0) hash = 1;
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(QP__Entry));
+  table->entry_count = 0;
+}
 
-  u64 idx  = hash & RP_MASK;
+static u32
+QP_Put(QP_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
   u64 step = 1;
 
-  u64 collision_len = 0;
-  while (data->rp.entries[idx].hash != 0)
+  if (hash == 0) hash = 1;
+
+  while (table->entries[idx].hash != 0)
   {
-    if (data->rp.entries[idx].hash == hash && data->strings[data->rp.entries[idx].string_idx] == s) break;
-    else
+    if (table->entries[idx].hash == hash && table->entries[idx].string == s) break;
+    idx += step++;
+    if (idx > table->table_mask) idx = 0;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+      s,
+    };
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
+typedef struct LPI__Entry
+{
+  u64 hash;
+  u32 id;
+} LPI__Entry;
+
+typedef struct LPI_Table
+{
+  u32 table_mask;
+  u32 entry_count;
+  LPI__Entry* entries;
+  String* strings;
+} LPI_Table;
+
+static LPI_Table
+LPI_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  LPI__Entry* entries = (LPI__Entry*)VirtualAlloc(0, table_size*sizeof(LPI__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  String* strings     = (String*)VirtualAlloc(0, table_size*sizeof(String), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries, strings };
+}
+
+static void
+LPI_Destroy(LPI_Table* table)
+{
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  VirtualFree(table->strings, 0, MEM_RELEASE);
+  *table = {};
+}
+
+static void
+LPI_Clear(LPI_Table* table)
+{
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(LPI__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+LPI_Put(LPI_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+
+  if (hash == 0) hash = 1;
+
+  while (table->entries[idx].hash != 0)
+  {
+    if (table->entries[idx].hash == hash && table->strings[table->entries[idx].id] == s) break;
+    idx += 1;
+    if (idx > table->table_mask) idx = 0;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+    };
+
+    table->strings[table->entry_count] = s;
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
+typedef struct QPI__Entry
+{
+  u64 hash;
+  u32 id;
+} QPI__Entry;
+
+typedef struct QPI_Table
+{
+  u32 table_mask;
+  u32 entry_count;
+  QPI__Entry* entries;
+  String* strings;
+} QPI_Table;
+
+static QPI_Table
+QPI_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  QPI__Entry* entries = (QPI__Entry*)VirtualAlloc(0, table_size*sizeof(QPI__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  String* strings     = (String*)VirtualAlloc(0, table_size*sizeof(String), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries, strings };
+}
+
+static void
+QPI_Destroy(QPI_Table* table)
+{
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  VirtualFree(table->strings, 0, MEM_RELEASE);
+  *table = {};
+}
+
+static void
+QPI_Clear(QPI_Table* table)
+{
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(QPI__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+QPI_Put(QPI_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+  u64 step = 1;
+
+  if (hash == 0) hash = 1;
+
+  while (table->entries[idx].hash != 0)
+  {
+    if (table->entries[idx].hash == hash && table->strings[table->entries[idx].id] == s) break;
+    idx += step++;
+    if (idx > table->table_mask) idx = 0;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+    };
+
+    table->strings[table->entry_count] = s;
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
+typedef struct LPIP__Entry
+{
+  u64 hash;
+  u32 id;
+  u16 prefix;
+} LPIP__Entry;
+
+typedef struct LPIP_Table
+{
+  u32 table_mask;
+  u32 entry_count;
+  LPIP__Entry* entries;
+  String* strings;
+} LPIP_Table;
+
+static LPIP_Table
+LPIP_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  LPIP__Entry* entries = (LPIP__Entry*)VirtualAlloc(0, table_size*sizeof(LPIP__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  String* strings     = (String*)VirtualAlloc(0, table_size*sizeof(String), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries, strings };
+}
+
+static void
+LPIP_Destroy(LPIP_Table* table)
+{
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  VirtualFree(table->strings, 0, MEM_RELEASE);
+  *table = {};
+}
+
+static void
+LPIP_Clear(LPIP_Table* table)
+{
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(LPIP__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+LPIP_Put(LPIP_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+
+  if (hash == 0) hash = 1;
+
+  u16 s_prefix = s.Prefix();
+  while (table->entries[idx].hash != 0)
+  {
+    if (table->entries[idx].hash == hash && table->entries[idx].prefix == s_prefix && table->strings[table->entries[idx].id] == s) break;
+    idx += 1;
+    if (idx > table->table_mask) idx = 0;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+      s.Prefix(),
+    };
+
+    table->strings[table->entry_count] = s;
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
+typedef struct QPIP__Entry
+{
+  u64 hash;
+  u32 id;
+  u16 prefix;
+} QPIP__Entry;
+
+typedef struct QPIP_Table
+{
+  u32 table_mask;
+  u32 entry_count;
+  QPIP__Entry* entries;
+  String* strings;
+} QPIP_Table;
+
+static QPIP_Table
+QPIP_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  QPIP__Entry* entries = (QPIP__Entry*)VirtualAlloc(0, table_size*sizeof(QPIP__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  String* strings     = (String*)VirtualAlloc(0, table_size*sizeof(String), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries, strings };
+}
+
+static void
+QPIP_Destroy(QPIP_Table* table)
+{
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  VirtualFree(table->strings, 0, MEM_RELEASE);
+  *table = {};
+}
+
+static void
+QPIP_Clear(QPIP_Table* table)
+{
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(QPIP__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+QPIP_Put(QPIP_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+  u64 step = 1;
+
+  if (hash == 0) hash = 1;
+
+  u16 s_prefix = s.Prefix();
+  while (table->entries[idx].hash != 0)
+  {
+    if (table->entries[idx].hash == hash && table->entries[idx].prefix == s_prefix && table->strings[table->entries[idx].id] == s) break;
+    idx += step++;
+    if (idx > table->table_mask) idx = 0;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+      s.Prefix(),
+    };
+
+    table->strings[table->entry_count] = s;
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
+typedef struct LPP__Entry
+{
+  u64 hash;
+  u32 id;
+  u16 prefix;
+  String string;
+} LPP__Entry;
+
+typedef struct LPP_Table
+{
+  u32 table_mask;
+  u32 entry_count;
+  LPP__Entry* entries;
+} LPP_Table;
+
+static LPP_Table
+LPP_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  LPP__Entry* entries = (LPP__Entry*)VirtualAlloc(0, table_size*sizeof(LPP__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries };
+}
+
+static void
+LPP_Destroy(LPP_Table* table)
+{
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  *table = {};
+}
+
+static void
+LPP_Clear(LPP_Table* table)
+{
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(LPP__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+LPP_Put(LPP_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+
+  if (hash == 0) hash = 1;
+
+  u16 s_prefix = s.Prefix();
+  while (table->entries[idx].hash != 0)
+  {
+    if (table->entries[idx].hash == hash && table->entries[idx].prefix == s_prefix && table->entries[idx].string == s) break;
+    idx += 1;
+    if (idx > table->table_mask) idx = 0;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+      s.Prefix(),
+      s,
+    };
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
+typedef struct QPP__Entry
+{
+  u64 hash;
+  u32 id;
+  u16 prefix;
+  String string;
+} QPP__Entry;
+
+typedef struct QPP_Table
+{
+  u32 table_mask;
+  u32 entry_count;
+  QPP__Entry* entries;
+} QPP_Table;
+
+static QPP_Table
+QPP_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  QPP__Entry* entries = (QPP__Entry*)VirtualAlloc(0, table_size*sizeof(QPP__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries };
+}
+
+static void
+QPP_Destroy(QPP_Table* table)
+{
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  *table = {};
+}
+
+static void
+QPP_Clear(QPP_Table* table)
+{
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(QPP__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+QPP_Put(QPP_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+  u64 step = 1;
+
+  if (hash == 0) hash = 1;
+
+  u16 s_prefix = s.Prefix();
+  while (table->entries[idx].hash != 0)
+  {
+    if (table->entries[idx].hash == hash && table->entries[idx].prefix == s_prefix && table->entries[idx].string == s) break;
+    idx += step++;
+    if (idx > table->table_mask) idx = 0;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+      s.Prefix(),
+      s,
+    };
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
+#define MIN_TIME_TTL 4
+
+typedef struct Result
+{
+  char* name;
+  u64 time;
+} Result;
+
+void
+SortResults(Result* results, u32 len)
+{
+  if (len <= 1) return;
+
+  u64 pivot = results[len-1].time;
+
+  u32 j = 0;
+  for (u32 i = 0; i < len; ++i)
+  {
+    if (results[i].time <= pivot)
     {
-      idx = (idx + step) & RP_MASK;
-      ++step;
-      ++collision_len;
+      Result tmp = results[j];
+      results[j] = results[i];
+      results[i] = tmp;
+      ++j;
     }
   }
 
-  if (data->rp.entries[idx].hash == 0)
-  {
-    data->rp.entries[idx].hash       = hash;
-    data->rp.entries[idx].string_idx = (u32)data->strings.size();
-    data->strings.push_back(s);
-    data->rp.entry_count += 1;
-  }
-
-  data->put_count += 1;
-  data->max_collision_len = (data->max_collision_len < collision_len ? collision_len : data->max_collision_len);
+  SortResults(results, j-1);
+  SortResults(results + j, len - j);
 }
-
-static u64
-RP_Size(Variant_Data* data)
-{
-  return data->rp.entry_count;
-}
-
-// ----------------- UMFNV
-
-static void
-UMFNV_Init(Variant_Data* data)
-{
-  data->umfnv.reserve(MAX_STRING_COUNT);
-}
-
-static void
-UMFNV_Put(Variant_Data* data, String s)
-{
-  if (data->umfnv.find(s) == data->umfnv.end())
-  {
-    data->umfnv.emplace(s, (u32)data->strings.size());
-    data->strings.push_back(s);
-  }
-}
-
-static u64
-UMFNV_Size(Variant_Data* data)
-{
-  return data->umfnv.size();
-}
-
-// ----------------- LPFNV
-
-#define LPFNV_SIZE_LG2 MAX_STRING_COUNT_LG2
-#define LPFNV_SIZE (1ULL << LPFNV_SIZE_LG2)
-#define LPFNV_MASK (LPFNV_SIZE-1)
-
-static void
-LPFNV_Init(Variant_Data* data)
-{
-  data->lp.entry_count = 0;
-  data->lp.entries = (LP_Entry*)VirtualAlloc(0, LPFNV_SIZE*sizeof(LP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-  
-  if (data->lp.entries == 0)
-  {
-    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
-    ExitProcess(-1);
-  }
-
-  PreFault(data->lp.entries, LPFNV_SIZE*sizeof(LP_Entry));
-}
-
-static void
-LPFNV_Put(Variant_Data* data, String s)
-{
-  u64 hash = FNV1A(s);
-  if (hash == 0) hash = 1;
-
-  u64 idx = FNV1A_MapToIdx(hash, LPFNV_SIZE_LG2);
-
-  while (data->lp.entries[idx].hash != 0)
-  {
-    if (data->lp.entries[idx].hash == hash && data->strings[data->lp.entries[idx].string_idx] == s) break;
-    else                                                                                            idx = (idx + 1) & LPFNV_MASK;
-  }
-
-  if (data->lp.entries[idx].hash == 0)
-  {
-    data->lp.entries[idx].hash       = hash;
-    data->lp.entries[idx].string_idx = (u32)data->strings.size();
-    data->strings.push_back(s);
-    data->lp.entry_count += 1;
-  }
-}
-
-static u64
-LPFNV_Size(Variant_Data* data)
-{
-  return data->lp.entry_count;
-}
-
-// ----------------- HPFNV
-
-#define HPFNV_SIZE_LG2 MAX_STRING_COUNT_LG2
-#define HPFNV_SIZE (1ULL << HPFNV_SIZE_LG2)
-#define HPFNV_MASK (HPFNV_SIZE-1)
-
-static void
-HPFNV_Init(Variant_Data* data)
-{
-  data->hp.entry_count = 0;
-  data->hp.entries = (HP_Entry*)VirtualAlloc(0, HPFNV_SIZE*sizeof(HP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-  
-  if (data->hp.entries == 0)
-  {
-    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
-    ExitProcess(-1);
-  }
-
-  PreFault(data->hp.entries, HPFNV_SIZE*sizeof(HP_Entry));
-}
-
-static void
-HPFNV_Put(Variant_Data* data, String s)
-{
-  u64 hash = FNV1A(s);
-  if (hash == 0) hash = 1;
-
-  u64 idx = FNV1A_MapToIdx(hash, HPFNV_SIZE_LG2);
-  u64 step = 1 + ((hash >> 24) & 0x3);
-
-  while (data->hp.entries[idx].hash != 0)
-  {
-    if (data->hp.entries[idx].hash == hash && data->strings[data->hp.entries[idx].string_idx] == s) break;
-    else                                                                                            idx = (idx + step) & HPFNV_MASK;
-  }
-
-  if (data->hp.entries[idx].hash == 0)
-  {
-    data->hp.entries[idx].hash       = hash;
-    data->hp.entries[idx].string_idx = (u32)data->strings.size();
-    data->strings.push_back(s);
-    data->hp.entry_count += 1;
-  }
-}
-
-static u64
-HPFNV_Size(Variant_Data* data)
-{
-  return data->hp.entry_count;
-}
-
-// ----------------- RPFNV
-
-#define RPFNV_SIZE_LG2 MAX_STRING_COUNT_LG2
-#define RPFNV_SIZE (1ULL << RPFNV_SIZE_LG2)
-#define RPFNV_MASK (RPFNV_SIZE-1)
-
-static void
-RPFNV_Init(Variant_Data* data)
-{
-  data->rp.entry_count = 0;
-  data->rp.entries = (RP_Entry*)VirtualAlloc(0, RPFNV_SIZE*sizeof(RP_Entry), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-  
-  if (data->rp.entries == 0)
-  {
-    fprintf(stderr, "Failed to allocate memory for Linear Probe hash table\n");
-    ExitProcess(-1);
-  }
-
-  PreFault(data->rp.entries, RPFNV_SIZE*sizeof(RP_Entry));
-}
-
-static void
-RPFNV_Put(Variant_Data* data, String s)
-{
-  u64 hash = FNV1A(s);
-  if (hash == 0) hash = 1;
-
-  u64 idx = FNV1A_MapToIdx(hash, RPFNV_SIZE_LG2);
-  u64 step_i = _rotr64(hash, RPFNV_SIZE_LG2);
-
-  while (data->rp.entries[idx].hash != 0)
-  {
-    if (data->rp.entries[idx].hash == hash && data->strings[data->rp.entries[idx].string_idx] == s) break;
-    else                                                                                            idx = (idx + 1 + ((step_i = _rotr64(step_i, 2))&0x3)) & RPFNV_MASK;
-  }
-
-  if (data->rp.entries[idx].hash == 0)
-  {
-    data->rp.entries[idx].hash       = hash;
-    data->rp.entries[idx].string_idx = (u32)data->strings.size();
-    data->strings.push_back(s);
-    data->rp.entry_count += 1;
-  }
-}
-
-static u64
-RPFNV_Size(Variant_Data* data)
-{
-  return data->rp.entry_count;
-}
-
-Variant Variants[] = {
-  { STUB_Init, STUB_Put, STUB_Size },
-  { UM_Init, UM_Put, UM_Size },
-  { LP_Init, LP_Put, LP_Size },
-  { OA_Init, OA_Put, OA_Size },
-  { HP_Init, HP_Put, HP_Size },
-  { RP_Init, RP_Put, RP_Size },
-  { UMFNV_Init, UMFNV_Put, UMFNV_Size },
-  { LPFNV_Init, LPFNV_Put, LPFNV_Size },
-  { HPFNV_Init, HPFNV_Put, HPFNV_Size },
-  { RPFNV_Init, RPFNV_Put, RPFNV_Size },
-};
 
 int
 main(int argc, char** argv)
 {
-  if (argc != 3)
+  Lexer lexer{};
+  if (argc != 2 || !Lexer_Init(argv[1], &lexer))
   {
-    fprintf(stderr, "Invalid Arguments. %s\n", USAGE_STR);
+    fprintf(stderr, "Invalid Arguments. Usage: hash_bench [path to c code file]\n");
     return -1;
   }
 
-  u64 variant_idx = 0;
-  for (char* scan = argv[1]; *scan != 0; ++scan)
+  u32 validation_array_cap = (1UL << 26);
+  u32 validation_array_len = 0;
+  u32* validation_array = (u32*)VirtualAlloc(0, validation_array_cap*sizeof(u32), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+  u32* result_array = (u32*)VirtualAlloc(0, validation_array_cap*sizeof(u32), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+
+  Result results[9] = {};
+
   {
-    if (!Char_IsDigit(*scan))
+    printf("ankerl\n");
+    u32 result_array_len = 0;
+
+    auto ankerl_map = ankerl::unordered_dense::map<String, u32>();
+    ankerl_map.reserve(MAX_STRING_COUNT);
+
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
     {
-      fprintf(stderr, "Invalid Input. Variant number is not a number\n%s\n", USAGE_STR);
-      return -1;
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      u32 string_idx = 0;
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          u32 id;
+
+          auto it = ankerl_map.find(token.string);
+          if (it != ankerl_map.end()) id = it->second;
+          else
+          {
+            ankerl_map.try_emplace(token.string, string_idx);
+            id = string_idx;
+            string_idx += 1;
+          }
+          
+          result_array[result_array_len++] = id;
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      ankerl_map.clear();
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
     }
 
-    variant_idx = variant_idx*10 + (*scan&0xF);
+    printf("\rmin time: %llu                           \n", min_time);
+    results[0] = { "ankerl", min_time };
+
+    validation_array_len = result_array_len;
+    memcpy(validation_array, result_array, validation_array_len*sizeof(u32));
   }
 
-  if (variant_idx >= ARRAY_SIZE(Variants))
   {
-    fprintf(stderr, "Invalid Input. Variant number is too large\n%s\n", USAGE_STR);
-    return -1;
-  }
+    printf("linear probing\n");
+    u32 result_array_len = 0;
 
-  Variant_Data data{};
-  Variant variant = Variants[variant_idx];
+    LP_Table lp_table = LP_Create(MAX_STRING_COUNT_LG2);
 
-  data.strings.reserve(MAX_STRING_COUNT);
-  variant.init(&data);
-
-  Lexer lexer = Lexer_Init(argv[2]);
-
-  u64 start_rdtsc = __rdtsc();
-  u64 watermark = 0;
-  //printf("%llu, %llu\n", 0ULL, __rdtsc() - start_rdtsc);
-
-  for (;;)
-  {
-    u64 sz = variant.size(&data);
-    if (sz > watermark && sz % 10000 == 0)
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
     {
-      watermark = sz;
-      //printf("%llu, %llu\n", sz, __rdtsc() - start_rdtsc);
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          result_array[result_array_len++] = LP_Put(&lp_table, token.string);
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      LP_Clear(&lp_table);
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
     }
 
-    for (;;)
-    {
-      Token token = Lexer_NextToken(&lexer);
-      if (token.kind == Token_Error || token.kind == Token_EOF || token.kind == Token_Ident) break;
-      else                                                                                   continue;
-    }
+    LP_Destroy(&lp_table);
 
-    if (lexer.token.kind == Token_Error || lexer.token.kind == Token_EOF) break;
-    else
+    printf("\rmin time: %llu                           \n", min_time);
+    results[1] = { "linear probing", min_time };
+
+    if (result_array_len != validation_array_len) __debugbreak();
+    for (u32 i = 0; i < result_array_len; ++i)
     {
-      variant.put(&data, lexer.token.string);
+      if (result_array[i] != validation_array[i]) __debugbreak();
     }
   }
 
-  if (lexer.token.kind != Token_EOF)
   {
-    //// ERROR
-    fprintf(stderr, "Lexer error\n");
-    return -1;
+    printf("quadratic probing [triangle numbers]\n");
+    u32 result_array_len = 0;
+
+    QP_Table qp_table = QP_Create(MAX_STRING_COUNT_LG2);
+
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
+    {
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          result_array[result_array_len++] = QP_Put(&qp_table, token.string);
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      QP_Clear(&qp_table);
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
+    }
+
+    QP_Destroy(&qp_table);
+
+    printf("\rmin time: %llu                           \n", min_time);
+    results[2] = { "quadratic probing [triangle numbers]", min_time };
+
+    if (result_array_len != validation_array_len) __debugbreak();
+    for (u32 i = 0; i < result_array_len; ++i)
+    {
+      if (result_array[i] != validation_array[i]) __debugbreak();
+    }
   }
 
-  printf("Found %llu identifiers\n", variant.size(&data));
-  printf("%llu, %llu, %llu (%llu)\n", data.put_count, variant.size(&data), data.max_collision_len, data.collisions);
+  {
+    printf("linear probing, prefix\n");
+    u32 result_array_len = 0;
+
+    LPP_Table lpp_table = LPP_Create(MAX_STRING_COUNT_LG2);
+
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
+    {
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          result_array[result_array_len++] = LPP_Put(&lpp_table, token.string);
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      LPP_Clear(&lpp_table);
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
+    }
+
+    LPP_Destroy(&lpp_table);
+
+    printf("\rmin time: %llu                           \n", min_time);
+    results[3] = { "linear probing, prefix", min_time };
+
+    if (result_array_len != validation_array_len) __debugbreak();
+    for (u32 i = 0; i < result_array_len; ++i)
+    {
+      if (result_array[i] != validation_array[i]) __debugbreak();
+    }
+  }
+
+  {
+    printf("quadratic probing [triangle numbers], prefix\n");
+    u32 result_array_len = 0;
+
+    QPP_Table qpp_table = QPP_Create(MAX_STRING_COUNT_LG2);
+
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
+    {
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          result_array[result_array_len++] = QPP_Put(&qpp_table, token.string);
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      QPP_Clear(&qpp_table);
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
+    }
+
+    QPP_Destroy(&qpp_table);
+
+    printf("\rmin time: %llu                           \n", min_time);
+    results[4] = { "quadratic probing [triangle numbers], prefix", min_time };
+
+    if (result_array_len != validation_array_len) __debugbreak();
+    for (u32 i = 0; i < result_array_len; ++i)
+    {
+      if (result_array[i] != validation_array[i]) __debugbreak();
+    }
+  }
+
+  {
+    printf("linear probing, indirect\n");
+    u32 result_array_len = 0;
+
+    LPI_Table lpi_table = LPI_Create(MAX_STRING_COUNT_LG2);
+
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
+    {
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          result_array[result_array_len++] = LPI_Put(&lpi_table, token.string);
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      LPI_Clear(&lpi_table);
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
+    }
+
+    LPI_Destroy(&lpi_table);
+
+    printf("\rmin time: %llu                           \n", min_time);
+    results[5] = { "linear probing, indirect", min_time };
+
+    if (result_array_len != validation_array_len) __debugbreak();
+    for (u32 i = 0; i < result_array_len; ++i)
+    {
+      if (result_array[i] != validation_array[i]) __debugbreak();
+    }
+  }
+
+  {
+    printf("quadratic probing [triangle numbers], indirect\n");
+    u32 result_array_len = 0;
+
+    QPI_Table qpi_table = QPI_Create(MAX_STRING_COUNT_LG2);
+
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
+    {
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          result_array[result_array_len++] = QPI_Put(&qpi_table, token.string);
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      QPI_Clear(&qpi_table);
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
+    }
+
+    QPI_Destroy(&qpi_table);
+
+    printf("\rmin time: %llu                           \n", min_time);
+    results[6] = { "quadratic probing [triangle numbers], indirect", min_time };
+
+    if (result_array_len != validation_array_len) __debugbreak();
+    for (u32 i = 0; i < result_array_len; ++i)
+    {
+      if (result_array[i] != validation_array[i]) __debugbreak();
+    }
+  }
+
+  {
+    printf("linear probing, indirect, prefix\n");
+    u32 result_array_len = 0;
+
+    LPIP_Table lpip_table = LPIP_Create(MAX_STRING_COUNT_LG2);
+
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
+    {
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          result_array[result_array_len++] = LPIP_Put(&lpip_table, token.string);
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      LPIP_Clear(&lpip_table);
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
+    }
+
+    LPIP_Destroy(&lpip_table);
+
+    printf("\rmin time: %llu                           \n", min_time);
+    results[7] = { "linear probing, indirect, prefix", min_time };
+
+    if (result_array_len != validation_array_len) __debugbreak();
+    for (u32 i = 0; i < result_array_len; ++i)
+    {
+      if (result_array[i] != validation_array[i]) __debugbreak();
+    }
+  }
+
+  {
+    printf("quadratic probing [triangle numbers], indirect, prefix\n");
+    u32 result_array_len = 0;
+
+    QPIP_Table qpip_table = QPIP_Create(MAX_STRING_COUNT_LG2);
+
+    u64 min_time = ~(u64)0;
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
+    {
+      result_array_len = 0;
+
+      u64 start = __rdtsc();
+
+      Token token = { Token_Invalid };
+      while (token.kind != Token_Error && token.kind != Token_EOF)
+      {
+        token = Lexer_NextToken(&lexer);
+
+        if (token.kind == Token_Ident)
+        {
+          result_array[result_array_len++] = QPIP_Put(&qpip_table, token.string);
+        }
+      }
+
+      u64 end = __rdtsc();
+
+      u64 time = end - start;
+
+      if (time < min_time)
+      {
+        min_time     = time;
+        min_time_age = 0;
+      }
+
+      Lexer_Reset(&lexer);
+      QPIP_Clear(&qpip_table);
+
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
+    }
+
+    QPIP_Destroy(&qpip_table);
+
+    printf("\rmin time: %llu                           \n", min_time);
+    results[8] = { "quadratic probing [triangle numbers], indirect, prefix", min_time };
+
+    if (result_array_len != validation_array_len) __debugbreak();
+    for (u32 i = 0; i < result_array_len; ++i)
+    {
+      if (result_array[i] != validation_array[i]) __debugbreak();
+    }
+  }
+
+  SortResults(results, ARRAY_SIZE(results));
+
+  for (u32 i = 0; i < ARRAY_SIZE(results); ++i)
+  {
+    printf("%19llu - %s\n", results[i].time, results[i].name);
+  }
 
   return 0;
 }
