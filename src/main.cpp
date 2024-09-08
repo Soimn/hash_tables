@@ -25,6 +25,10 @@ typedef double f64;
 
 #define ARRAY_SIZE(A) (sizeof(A)/sizeof(0[A]))
 
+#define CONCAT__(A, B) A##B
+#define CONCAT_(A, B) CONCAT__(A, B)
+#define CONCAT(A, B) CONCAT_(A, B)
+
 #define USE_SSO 0
 #define USE_FNV1A 0
 
@@ -1165,6 +1169,176 @@ QPP_Put(QPP_Table* table, String s)
   return table->entries[idx].id;
 }
 
+typedef struct QPS__Entry
+{
+  u64 hash;
+  u32 id;
+  u16 len;
+  u16 pad;
+  u8* data;
+  u8* ptr_pad;
+} QPS__Entry;
+
+typedef struct QPS_Table
+{
+  u32 table_mask;
+  u32 entry_count;
+  QPS__Entry* entries;
+} QPS_Table;
+
+static QPS_Table
+QPS_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  QPS__Entry* entries = (QPS__Entry*)VirtualAlloc(0, table_size*sizeof(QPS__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries };
+}
+
+static void
+QPS_Destroy(QPS_Table* table)
+{
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  *table = {};
+}
+
+static void
+QPS_Clear(QPS_Table* table)
+{
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(QPS__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+QPS_Put(QPS_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+  u64 step = 1;
+
+  if (hash == 0) hash = 1;
+
+  while (table->entries[idx].hash != 0)
+  {
+    if (table->entries[idx].hash == hash)
+    {
+      bool does_match = ((u64)table->entries[idx].len == s.len);
+
+      u8* entry_str = (table->entries[idx].len <= 18 ? (u8*)&table->entries[idx].pad : table->entries[idx].data);
+
+      for (u16 i = 0; i < table->entries[idx].len && does_match; ++i) does_match = (entry_str[i] == s.data[i]);
+
+      if (does_match) break;
+    }
+
+    idx = (idx + step++) & table->table_mask;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      table->entry_count,
+      (u16)s.len,
+      0,
+      0,
+    };
+
+    if (s.len <= 18) memcpy(&table->entries[idx].pad, s.data, s.len);
+    else             table->entries[idx].data = s.data;
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
+typedef struct QPGCC__Entry
+{
+  u64 hash;
+  u8* data;
+  u8 pad[10];
+  u16 len;
+  u32 id;
+} QPGCC__Entry;
+
+typedef struct QPGCC_Table
+{
+  u32 table_mask;
+  u32 entry_count;
+  QPGCC__Entry* entries;
+} QPGCC_Table;
+
+static QPGCC_Table
+QPGCC_Create(u8 table_size_lg2)
+{
+  u32 table_size = 1UL << table_size_lg2;
+
+  QPGCC__Entry* entries = (QPGCC__Entry*)VirtualAlloc(0, table_size*sizeof(QPGCC__Entry), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+  return { table_size-1, 0, entries };
+}
+
+static void
+QPGCC_Destroy(QPGCC_Table* table)
+{
+  VirtualFree(table->entries, 0, MEM_RELEASE);
+  *table = {};
+}
+
+static void
+QPGCC_Clear(QPGCC_Table* table)
+{
+  memset(table->entries, 0, (table->table_mask+1)*sizeof(QPGCC__Entry));
+  table->entry_count = 0;
+}
+
+static u32
+QPGCC_Put(QPGCC_Table* table, String s)
+{
+  u64 hash = s.Hash();
+  u64 idx  = hash & table->table_mask;
+  u64 step = 1;
+
+  if (hash == 0) hash = 1;
+
+  while (table->entries[idx].hash != 0)
+  {
+    if (table->entries[idx].hash == hash)
+    {
+      bool does_match = ((u64)table->entries[idx].len == s.len);
+
+      for (u16 i = 0; i < table->entries[idx].len && does_match; ++i) does_match = (table->entries[idx].data[i] == s.data[i]);
+
+      if (does_match) break;
+    }
+
+    idx = (idx + step++) & table->table_mask;
+  }
+
+  if (table->entries[idx].hash == 0)
+  {
+    table->entries[idx] = {
+      hash,
+      s.data,
+      {},
+      (u16)s.len,
+      table->entry_count,
+    };
+
+    if (s.len <= 10)
+    {
+      s.data = table->entries[idx].pad;
+      memcpy(table->entries[idx].pad, s.data, s.len);
+    }
+
+    table->entry_count += 1;
+  }
+
+  return table->entries[idx].id;
+}
+
 #define MIN_TIME_TTL 4
 
 typedef struct Result
@@ -1196,6 +1370,69 @@ SortResults(Result* results, u32 len)
   SortResults(results + j, len - j);
 }
 
+#define TEST_TABLE(IDX, NAME, PREFIX)                                                     \
+  {                                                                                       \
+    printf(NAME "\n");                                                                    \
+    u32 result_array_len = 0;                                                             \
+                                                                                          \
+    CONCAT(PREFIX, _Table) table = CONCAT(PREFIX, _Create)(MAX_STRING_COUNT_LG2);         \
+                                                                                          \
+    u64 min_time = ~(u64)0;                                                               \
+    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)               \
+    {                                                                                     \
+      result_array_len = 0;                                                               \
+                                                                                          \
+      for (u8* scan = lexer.input; *scan != 0; ++scan)                                    \
+      {                                                                                   \
+        _mm_clflushopt(scan);                                                             \
+        for (u32 i = 0; i < 64; ++i, ++scan)                                              \
+        {                                                                                 \
+          if (*scan == 0) break;                                                          \
+        }                                                                                 \
+      }                                                                                   \
+                                                                                          \
+      u64 start = __rdtsc();                                                              \
+                                                                                          \
+      Token token = { Token_Invalid };                                                    \
+      while (token.kind != Token_Error && token.kind != Token_EOF)                        \
+      {                                                                                   \
+        token = Lexer_NextToken(&lexer);                                                  \
+        Token_Kind id = token.kind;                                                       \
+        if (token.kind == Token_Ident)                                                    \
+        {                                                                                 \
+          id = (Token_Kind)CONCAT(PREFIX, _Put)(&table, token.string);                    \
+        }                                                                                 \
+        result_array[result_array_len++] = id;                                            \
+      }                                                                                   \
+                                                                                          \
+      u64 end = __rdtsc();                                                                \
+                                                                                          \
+      u64 time = end - start;                                                             \
+                                                                                          \
+      if (time < min_time)                                                                \
+      {                                                                                   \
+        min_time     = time;                                                              \
+        min_time_age = 0;                                                                 \
+      }                                                                                   \
+                                                                                          \
+      Lexer_Reset(&lexer);                                                                \
+      CONCAT(PREFIX, _Clear)(&table);                                                     \
+                                                                                          \
+      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);        \
+    }                                                                                     \
+                                                                                          \
+    CONCAT(PREFIX, _Destroy)(&table);                                                     \
+                                                                                          \
+    printf("\rmin time: %llu                           \n", min_time);                    \
+    results[IDX] = { NAME, min_time };                                                    \
+                                                                                          \
+    if (result_array_len != validation_array_len) __debugbreak();                         \
+    for (u32 i = 0; i < result_array_len; ++i)                                            \
+    {                                                                                     \
+      if (result_array[i] != validation_array[i]) __debugbreak();                         \
+    }                                                                                     \
+  }                                                                                       \
+
 int
 main(int argc, char** argv)
 {
@@ -1206,12 +1443,12 @@ main(int argc, char** argv)
     return -1;
   }
 
-  u32 validation_array_cap = (1UL << 26);
+  u32 validation_array_cap = (1UL << 28);
   u32 validation_array_len = 0;
-  u32* validation_array = (u32*)VirtualAlloc(0, validation_array_cap*sizeof(u32), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-  u32* result_array = (u32*)VirtualAlloc(0, validation_array_cap*sizeof(u32), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+  Token_Kind* validation_array = (Token_Kind*)VirtualAlloc(0, validation_array_cap*sizeof(Token_Kind), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
+  Token_Kind* result_array = (Token_Kind*)VirtualAlloc(0, validation_array_cap*sizeof(Token_Kind), MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
 
-  Result results[9] = {};
+  Result results[11] = {};
 
   {
     printf("ankerl\n");
@@ -1225,6 +1462,15 @@ main(int argc, char** argv)
     {
       result_array_len = 0;
 
+      for (u8* scan = lexer.input; *scan != 0; ++scan)
+      {
+        _mm_clflushopt(scan);
+        for (u32 i = 0; i < 64; ++i, ++scan)
+        {
+          if (*scan == 0) break;
+        }
+      }
+
       u64 start = __rdtsc();
 
       u32 string_idx = 0;
@@ -1233,21 +1479,21 @@ main(int argc, char** argv)
       {
         token = Lexer_NextToken(&lexer);
 
+        Token_Kind id = token.kind;
+
         if (token.kind == Token_Ident)
         {
-          u32 id;
-
           auto it = ankerl_map.find(token.string);
-          if (it != ankerl_map.end()) id = it->second;
+          if (it != ankerl_map.end()) id = (Token_Kind)it->second;
           else
           {
             ankerl_map.try_emplace(token.string, string_idx);
-            id = string_idx;
+            id = (Token_Kind)string_idx;
             string_idx += 1;
           }
-          
-          result_array[result_array_len++] = id;
         }
+
+        result_array[result_array_len++] = id;
       }
 
       u64 end = __rdtsc();
@@ -1273,421 +1519,16 @@ main(int argc, char** argv)
     memcpy(validation_array, result_array, validation_array_len*sizeof(u32));
   }
 
-  {
-    printf("linear probing\n");
-    u32 result_array_len = 0;
-
-    LP_Table lp_table = LP_Create(MAX_STRING_COUNT_LG2);
-
-    u64 min_time = ~(u64)0;
-    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
-    {
-      result_array_len = 0;
-
-      u64 start = __rdtsc();
-
-      Token token = { Token_Invalid };
-      while (token.kind != Token_Error && token.kind != Token_EOF)
-      {
-        token = Lexer_NextToken(&lexer);
-
-        if (token.kind == Token_Ident)
-        {
-          result_array[result_array_len++] = LP_Put(&lp_table, token.string);
-        }
-      }
-
-      u64 end = __rdtsc();
-
-      u64 time = end - start;
-
-      if (time < min_time)
-      {
-        min_time     = time;
-        min_time_age = 0;
-      }
-
-      Lexer_Reset(&lexer);
-      LP_Clear(&lp_table);
-
-      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
-    }
-
-    LP_Destroy(&lp_table);
-
-    printf("\rmin time: %llu                           \n", min_time);
-    results[1] = { "linear probing", min_time };
-
-    if (result_array_len != validation_array_len) __debugbreak();
-    for (u32 i = 0; i < result_array_len; ++i)
-    {
-      if (result_array[i] != validation_array[i]) __debugbreak();
-    }
-  }
-
-  {
-    printf("quadratic probing [triangle numbers]\n");
-    u32 result_array_len = 0;
-
-    QP_Table qp_table = QP_Create(MAX_STRING_COUNT_LG2);
-
-    u64 min_time = ~(u64)0;
-    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
-    {
-      result_array_len = 0;
-
-      u64 start = __rdtsc();
-
-      Token token = { Token_Invalid };
-      while (token.kind != Token_Error && token.kind != Token_EOF)
-      {
-        token = Lexer_NextToken(&lexer);
-
-        if (token.kind == Token_Ident)
-        {
-          result_array[result_array_len++] = QP_Put(&qp_table, token.string);
-        }
-      }
-
-      u64 end = __rdtsc();
-
-      u64 time = end - start;
-
-      if (time < min_time)
-      {
-        min_time     = time;
-        min_time_age = 0;
-      }
-
-      Lexer_Reset(&lexer);
-      QP_Clear(&qp_table);
-
-      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
-    }
-
-    QP_Destroy(&qp_table);
-
-    printf("\rmin time: %llu                           \n", min_time);
-    results[2] = { "quadratic probing [triangle numbers]", min_time };
-
-    if (result_array_len != validation_array_len) __debugbreak();
-    for (u32 i = 0; i < result_array_len; ++i)
-    {
-      if (result_array[i] != validation_array[i]) __debugbreak();
-    }
-  }
-
-  {
-    printf("linear probing, prefix\n");
-    u32 result_array_len = 0;
-
-    LPP_Table lpp_table = LPP_Create(MAX_STRING_COUNT_LG2);
-
-    u64 min_time = ~(u64)0;
-    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
-    {
-      result_array_len = 0;
-
-      u64 start = __rdtsc();
-
-      Token token = { Token_Invalid };
-      while (token.kind != Token_Error && token.kind != Token_EOF)
-      {
-        token = Lexer_NextToken(&lexer);
-
-        if (token.kind == Token_Ident)
-        {
-          result_array[result_array_len++] = LPP_Put(&lpp_table, token.string);
-        }
-      }
-
-      u64 end = __rdtsc();
-
-      u64 time = end - start;
-
-      if (time < min_time)
-      {
-        min_time     = time;
-        min_time_age = 0;
-      }
-
-      Lexer_Reset(&lexer);
-      LPP_Clear(&lpp_table);
-
-      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
-    }
-
-    LPP_Destroy(&lpp_table);
-
-    printf("\rmin time: %llu                           \n", min_time);
-    results[3] = { "linear probing, prefix", min_time };
-
-    if (result_array_len != validation_array_len) __debugbreak();
-    for (u32 i = 0; i < result_array_len; ++i)
-    {
-      if (result_array[i] != validation_array[i]) __debugbreak();
-    }
-  }
-
-  {
-    printf("quadratic probing [triangle numbers], prefix\n");
-    u32 result_array_len = 0;
-
-    QPP_Table qpp_table = QPP_Create(MAX_STRING_COUNT_LG2);
-
-    u64 min_time = ~(u64)0;
-    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
-    {
-      result_array_len = 0;
-
-      u64 start = __rdtsc();
-
-      Token token = { Token_Invalid };
-      while (token.kind != Token_Error && token.kind != Token_EOF)
-      {
-        token = Lexer_NextToken(&lexer);
-
-        if (token.kind == Token_Ident)
-        {
-          result_array[result_array_len++] = QPP_Put(&qpp_table, token.string);
-        }
-      }
-
-      u64 end = __rdtsc();
-
-      u64 time = end - start;
-
-      if (time < min_time)
-      {
-        min_time     = time;
-        min_time_age = 0;
-      }
-
-      Lexer_Reset(&lexer);
-      QPP_Clear(&qpp_table);
-
-      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
-    }
-
-    QPP_Destroy(&qpp_table);
-
-    printf("\rmin time: %llu                           \n", min_time);
-    results[4] = { "quadratic probing [triangle numbers], prefix", min_time };
-
-    if (result_array_len != validation_array_len) __debugbreak();
-    for (u32 i = 0; i < result_array_len; ++i)
-    {
-      if (result_array[i] != validation_array[i]) __debugbreak();
-    }
-  }
-
-  {
-    printf("linear probing, indirect\n");
-    u32 result_array_len = 0;
-
-    LPI_Table lpi_table = LPI_Create(MAX_STRING_COUNT_LG2);
-
-    u64 min_time = ~(u64)0;
-    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
-    {
-      result_array_len = 0;
-
-      u64 start = __rdtsc();
-
-      Token token = { Token_Invalid };
-      while (token.kind != Token_Error && token.kind != Token_EOF)
-      {
-        token = Lexer_NextToken(&lexer);
-
-        if (token.kind == Token_Ident)
-        {
-          result_array[result_array_len++] = LPI_Put(&lpi_table, token.string);
-        }
-      }
-
-      u64 end = __rdtsc();
-
-      u64 time = end - start;
-
-      if (time < min_time)
-      {
-        min_time     = time;
-        min_time_age = 0;
-      }
-
-      Lexer_Reset(&lexer);
-      LPI_Clear(&lpi_table);
-
-      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
-    }
-
-    LPI_Destroy(&lpi_table);
-
-    printf("\rmin time: %llu                           \n", min_time);
-    results[5] = { "linear probing, indirect", min_time };
-
-    if (result_array_len != validation_array_len) __debugbreak();
-    for (u32 i = 0; i < result_array_len; ++i)
-    {
-      if (result_array[i] != validation_array[i]) __debugbreak();
-    }
-  }
-
-  {
-    printf("quadratic probing [triangle numbers], indirect\n");
-    u32 result_array_len = 0;
-
-    QPI_Table qpi_table = QPI_Create(MAX_STRING_COUNT_LG2);
-
-    u64 min_time = ~(u64)0;
-    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
-    {
-      result_array_len = 0;
-
-      u64 start = __rdtsc();
-
-      Token token = { Token_Invalid };
-      while (token.kind != Token_Error && token.kind != Token_EOF)
-      {
-        token = Lexer_NextToken(&lexer);
-
-        if (token.kind == Token_Ident)
-        {
-          result_array[result_array_len++] = QPI_Put(&qpi_table, token.string);
-        }
-      }
-
-      u64 end = __rdtsc();
-
-      u64 time = end - start;
-
-      if (time < min_time)
-      {
-        min_time     = time;
-        min_time_age = 0;
-      }
-
-      Lexer_Reset(&lexer);
-      QPI_Clear(&qpi_table);
-
-      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
-    }
-
-    QPI_Destroy(&qpi_table);
-
-    printf("\rmin time: %llu                           \n", min_time);
-    results[6] = { "quadratic probing [triangle numbers], indirect", min_time };
-
-    if (result_array_len != validation_array_len) __debugbreak();
-    for (u32 i = 0; i < result_array_len; ++i)
-    {
-      if (result_array[i] != validation_array[i]) __debugbreak();
-    }
-  }
-
-  {
-    printf("linear probing, indirect, prefix\n");
-    u32 result_array_len = 0;
-
-    LPIP_Table lpip_table = LPIP_Create(MAX_STRING_COUNT_LG2);
-
-    u64 min_time = ~(u64)0;
-    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
-    {
-      result_array_len = 0;
-
-      u64 start = __rdtsc();
-
-      Token token = { Token_Invalid };
-      while (token.kind != Token_Error && token.kind != Token_EOF)
-      {
-        token = Lexer_NextToken(&lexer);
-
-        if (token.kind == Token_Ident)
-        {
-          result_array[result_array_len++] = LPIP_Put(&lpip_table, token.string);
-        }
-      }
-
-      u64 end = __rdtsc();
-
-      u64 time = end - start;
-
-      if (time < min_time)
-      {
-        min_time     = time;
-        min_time_age = 0;
-      }
-
-      Lexer_Reset(&lexer);
-      LPIP_Clear(&lpip_table);
-
-      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
-    }
-
-    LPIP_Destroy(&lpip_table);
-
-    printf("\rmin time: %llu                           \n", min_time);
-    results[7] = { "linear probing, indirect, prefix", min_time };
-
-    if (result_array_len != validation_array_len) __debugbreak();
-    for (u32 i = 0; i < result_array_len; ++i)
-    {
-      if (result_array[i] != validation_array[i]) __debugbreak();
-    }
-  }
-
-  {
-    printf("quadratic probing [triangle numbers], indirect, prefix\n");
-    u32 result_array_len = 0;
-
-    QPIP_Table qpip_table = QPIP_Create(MAX_STRING_COUNT_LG2);
-
-    u64 min_time = ~(u64)0;
-    for (u64 min_time_age = 0; min_time_age < MIN_TIME_TTL; ++min_time_age)
-    {
-      result_array_len = 0;
-
-      u64 start = __rdtsc();
-
-      Token token = { Token_Invalid };
-      while (token.kind != Token_Error && token.kind != Token_EOF)
-      {
-        token = Lexer_NextToken(&lexer);
-
-        if (token.kind == Token_Ident)
-        {
-          result_array[result_array_len++] = QPIP_Put(&qpip_table, token.string);
-        }
-      }
-
-      u64 end = __rdtsc();
-
-      u64 time = end - start;
-
-      if (time < min_time)
-      {
-        min_time     = time;
-        min_time_age = 0;
-      }
-
-      Lexer_Reset(&lexer);
-      QPIP_Clear(&qpip_table);
-
-      printf("\rmin time: %llu (%llu)                  ", min_time, min_time_age);
-    }
-
-    QPIP_Destroy(&qpip_table);
-
-    printf("\rmin time: %llu                           \n", min_time);
-    results[8] = { "quadratic probing [triangle numbers], indirect, prefix", min_time };
-
-    if (result_array_len != validation_array_len) __debugbreak();
-    for (u32 i = 0; i < result_array_len; ++i)
-    {
-      if (result_array[i] != validation_array[i]) __debugbreak();
-    }
-  }
+  TEST_TABLE(1,  "quadratic probing [triangle numbers]",                   QP);
+  TEST_TABLE(2,  "quadratic probing [triangle numbers], gcc small string", QPGCC);
+  TEST_TABLE(3,  "quadratic probing [triangle numbers], small string",     QPS);
+  TEST_TABLE(4,  "linear probing",                                         LP);
+  TEST_TABLE(5,  "linear probing, prefix",                                 LPP);
+  TEST_TABLE(6,  "quadratic probing [triangle numbers], prefix",           QPP);
+  TEST_TABLE(7,  "linear probing, indirect",                               LPI);
+  TEST_TABLE(8,  "quadratic probing [triangle numbers], indirect",         QPI);
+  TEST_TABLE(9,  "linear probing, indirect, prefix",                       LPIP);
+  TEST_TABLE(10, "quadratic probing [triangle numbers], indirect, prefix", QPIP);
 
   SortResults(results, ARRAY_SIZE(results));
 
