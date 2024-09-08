@@ -722,8 +722,7 @@ QP_Put(QP_Table* table, String s)
   while (table->entries[idx].hash != 0)
   {
     if (table->entries[idx].hash == hash && table->entries[idx].string == s) break;
-    idx += step++;
-    if (idx > table->table_mask) idx = 0;
+    idx = (idx + step++) & table->table_mask;
   }
 
   if (table->entries[idx].hash == 0)
@@ -862,8 +861,7 @@ QPI_Put(QPI_Table* table, String s)
   while (table->entries[idx].hash != 0)
   {
     if (table->entries[idx].hash == hash && table->strings[table->entries[idx].id] == s) break;
-    idx += step++;
-    if (idx > table->table_mask) idx = 0;
+    idx = (idx + step++) & table->table_mask;
   }
 
   if (table->entries[idx].hash == 0)
@@ -1008,8 +1006,7 @@ QPIP_Put(QPIP_Table* table, String s)
   while (table->entries[idx].hash != 0)
   {
     if (table->entries[idx].hash == hash && table->entries[idx].prefix == s_prefix && table->strings[table->entries[idx].id] == s) break;
-    idx += step++;
-    if (idx > table->table_mask) idx = 0;
+    idx = (idx + step++) & table->table_mask;
   }
 
   if (table->entries[idx].hash == 0)
@@ -1150,8 +1147,7 @@ QPP_Put(QPP_Table* table, String s)
   while (table->entries[idx].hash != 0)
   {
     if (table->entries[idx].hash == hash && table->entries[idx].prefix == s_prefix && table->entries[idx].string == s) break;
-    idx += step++;
-    if (idx > table->table_mask) idx = 0;
+    idx = (idx + step++) & table->table_mask;
   }
 
   if (table->entries[idx].hash == 0)
