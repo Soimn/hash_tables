@@ -1258,9 +1258,9 @@ typedef struct QPGCC__Entry
 {
   u64 hash;
   u8* data;
-  u8 pad[10];
-  u16 len;
   u32 id;
+  u16 len;
+  u8 pad[10];
 } QPGCC__Entry;
 
 typedef struct QPGCC_Table
@@ -1322,15 +1322,15 @@ QPGCC_Put(QPGCC_Table* table, String s)
     table->entries[idx] = {
       hash,
       s.data,
-      {},
-      (u16)s.len,
       table->entry_count,
+      (u16)s.len,
+      {},
     };
 
     if (s.len <= 10)
     {
-      s.data = table->entries[idx].pad;
       memcpy(table->entries[idx].pad, s.data, s.len);
+      table->entries[idx].data = table->entries[idx].pad;
     }
 
     table->entry_count += 1;
